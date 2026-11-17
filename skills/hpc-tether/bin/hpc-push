@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""Push a locally edited file back to the cluster — with drift check and backup.
+
+The other half of pull → edit locally → push (reference/file-transfer.md).
+Every push:
+
+  0. is refused unless the site's profile is ``prepare`` or above, the
+     destination is inside a write root (scratch or ``[policy] write_roots``, not a protected path,
+     through ``[aliases]``), it puts no code file in a script root, and git
+     does not track it -- tracked files sync only through git
+  1. finds the destination from the hpc-pull manifest entry (or ``--to``)
+  2. re-checksums the remote file and REFUSES if it changed since the pull —
+     the drifted remote copy may be someone else's edit, and overwriting it
+     silently would destroy the only copy (this read-only precheck also asks
+     git whether it tracks the destination)
+  3. requires ``--yes``, a confirmation token the skill ties to explicit
+     per-write user approval; it is checked after the precheck, so the user
+     is never asked to approve a push that would be refused anyway
+  4. uploads beside the destination, then re-verifies, backs up to
+     ``<scratch>/hpc-tether-backups/<name>.<stamp>.<hash8>`` and renames into
+     place in ONE remote call, so every push is reversible and atomic
+  5. updates the manifest afterward so further edit/push rounds keep working
+
+Step 4 is a compare-and-swap, and the ordering is the point. Checksumming and
+backing up in one call and overwriting in a separate ``scp`` left a window:
+a remote edit landing in between was destroyed *and* missing from the backup,
+because the backup predated it. ``scp`` writing onto the destination directly
+also meant an interrupted transfer truncated it — no second party required.
+Uploading to ``<dest>.hpc-push.<pid>.<stamp>`` and renaming closes both: the
+verify and the rename are adjacent, and a reader sees either the old file or
+the new one, never a partial write.
+
+The temp file goes beside the destination, never in scratch. ``mv`` is atomic
+only within a filesystem, and on many clusters scratch and project directories
+are different filesystems — a scratch temp would silently become a cross-device
+copy and reopen the truncation window.
+
+Exit codes:
+    0    pushed (and backed up)
+    64   usage error, unknown site, or no manifest entry and no --to
+    65   refused: remote drifted since pull, remote exists with no manifest
+         entry (pull it first, or pass --force), or the destination changed
+         while the file was uploading — in every case the remote is untouched
+    69   no ControlMaster socket
+    70   remote commit failed (temp file vanished, or a backup of that name
+         already exists); the destination was not modified and the temp file
+         is left in place
+    77   refused before transfer: --yes missing, the profile is below
+         prepare, the destination is outside the write roots, it would put a
+         code file in a script root, or git tracks it; no file was sent (the
+         git and drift checks are one read-only remote call)
+    124  timeout
+    255  ssh/scp transport failure
+
+On any failure after the upload, the destination is left exactly as found and
+the uploaded temp file is left beside it with its path printed. The toolkit
+never deletes on the cluster, not even its own temp files; the transport
+refuses any payload containing ``rm``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shlex
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the installed skill
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hpctether import audit, confine, manifest
+from hpctether import profile as profile_mod
+from hpctether import site as site_mod
+from hpctether import transport
+
+EXIT_REFUSED = 65
+
+
+def _report_temp(target, tmp_path: str) -> None:
+    """Name the abandoned upload after a failed transfer.
+
+    The toolkit never deletes anything on the cluster, not even a temp file
+    it created a moment ago -- the transport refuses any payload containing
+    ``rm``. So a failed push leaves its partial upload beside the destination
+    and says exactly where; the destination itself is untouched.
+    """
+    print(f"hpc-push: partial upload left at {target.host}:{tmp_path} -- "
+          "the destination was NOT modified; remove the temp file by hand",
+          file=sys.stderr)
+
+
+def _refuse(target, remote_path: str, message: str, reason: str, code: int) -> int:
+    """Print a refusal and log it, so the receipt names the refusal rather
+    than the read-only precheck that preceded it."""
+    print(f"hpc-push: {message}", file=sys.stderr)
+    audit.record("refused", target.name, target.host, f"push to {remote_path}", code,
+                 extra={"refusal": reason})
+    return code
+
+
+def _sha256(path: Path) -> str:
+    """sha256 of a local file, read in chunks so a large file stays cheap."""
+    import hashlib
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+#: Remote precheck. Line 1: the current remote sha256, or MISSING. Line 2:
+#: GIT_ERROR if git failed for any other reason: a corrupt repository or a
+#: permissions error used to read as UNTRACKED, and the push went ahead
+#:. Only a positive UNTRACKED lets a push on.
+#: TRACKED if git tracks the destination, UNTRACKED if not (a new file, a file
+#: outside any repository, or a gitignored one), GIT_UNAVAILABLE if there is no
+#: git to ask. Read-only: the backup is deliberately NOT taken here. Backing up
+#: before the upload leaves the backup describing a state that may be stale by
+#: the time the file is actually replaced -- see _COMMIT_SCRIPT.
+_PRECHECK_SCRIPT = """
+p="$1"
+if [ ! -e "$p" ]; then
+  echo "MISSING"
+else
+  sha256sum -- "$p" | cut -d' ' -f1
+fi
+d="$(dirname -- "$p")"
+if ! command -v git >/dev/null 2>&1; then
+  echo "GIT_UNAVAILABLE"
+elif [ ! -d "$d" ]; then
+  echo "UNTRACKED"
+elif ! hpc_top="$(LC_ALL=C git -C "$d" rev-parse --show-toplevel 2>&1)"; then
+  case "$hpc_top" in
+    *"not a git repository (or any"*) echo "UNTRACKED" ;;
+    *) echo "GIT_ERROR" ;;
+  esac
+else
+  hpc_rc=0
+  git -C "$d" ls-files --error-unmatch -- "$(basename -- "$p")" >/dev/null 2>&1 || hpc_rc=$?
+  case "$hpc_rc" in
+    0) echo "TRACKED" ;;
+    1) echo "UNTRACKED" ;;
+    *) echo "GIT_ERROR" ;;
+  esac
+fi
+"""
+
+#: Remote commit: re-verify, back up, and swap in the uploaded file.
+#:
+#: This runs as ONE remote call after `scp` has landed the new bytes beside the
+#: destination. Doing the verify, the backup, and the rename together is the
+#: whole point: previously the checksum and backup happened in one ssh call and
+#: the overwrite in a separate scp, so a remote edit landing in between was
+#: destroyed *and* absent from the backup -- the backup predated it.
+#:
+#: The rename is atomic within a filesystem, which is why the temp file is
+#: uploaded beside the destination rather than into scratch: on many
+#: clusters scratch and the project directories are different
+#: filesystems, so a scratch temp would make this a cross-device copy and
+#: reintroduce the truncation window it exists to close.
+#:
+#: Exit 65 means the destination changed under us: the temp is removed and the
+#: destination left exactly as found.
+_COMMIT_SCRIPT = """
+p="$1"; tmp="$2"; expected="$3"; backup_dir="$4"; backup_name="$5"
+
+if [ ! -f "$tmp" ]; then
+  echo "hpc-push: uploaded temp file is missing: $tmp" >&2
+  exit 70
+fi
+
+if [ "$expected" = "MISSING" ]; then
+  if [ -e "$p" ]; then
+    echo "hpc-push: destination appeared during upload; temp left at $tmp" >&2
+    echo "CONFLICT $(sha256sum -- "$p" | cut -d' ' -f1)"
+    exit 65
+  fi
+else
+  if [ ! -e "$p" ]; then
+    echo "hpc-push: destination vanished during upload; temp left at $tmp" >&2
+    echo "CONFLICT MISSING"
+    exit 65
+  fi
+  current=$(sha256sum -- "$p" | cut -d' ' -f1)
+  if [ "$current" != "$expected" ]; then
+    echo "hpc-push: temp left at $tmp" >&2
+    echo "CONFLICT $current"
+    exit 65
+  fi
+  if [ -n "$backup_dir" ]; then
+    mkdir -p -- "$backup_dir"
+    # Never clobber an existing backup: the name carries a 1-second stamp, so
+    # two pushes of the same file in one second would otherwise collide and the
+    # older -- possibly the only untouched copy -- would be lost.
+    if [ -e "$backup_dir/$backup_name" ]; then
+      echo "hpc-push: backup already exists: $backup_dir/$backup_name; temp left at $tmp" >&2
+      exit 70
+    fi
+    cp -p -- "$p" "$backup_dir/$backup_name"
+    echo "BACKUP $backup_dir/$backup_name"
+  fi
+fi
+
+# Same directory, same filesystem: this replaces the destination atomically.
+# A reader either sees the old file or the new one, never a partial write.
+mv -f -- "$tmp" "$p"
+echo "COMMITTED"
+"""
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(allow_abbrev=False, 
+        prog="hpc-push",
+        description=(
+            "Push a locally edited file back to the cluster. Refuses if the "
+            "remote changed since hpc-pull; backs up the remote copy first."
+        ),
+        epilog=(
+            "Exit: 0 ok, 64 usage, 65 drift/overwrite refusal, 69 no master, "
+            "77 missing --yes, 124 timeout, 255 transport failure."
+        ),
+    )
+    parser.add_argument("local", metavar="LOCAL", help="locally edited file to push")
+    parser.add_argument(
+        "--to",
+        metavar="REMOTE",
+        help="remote destination (absolute or role:relative); defaults to the "
+        "manifest entry recorded by hpc-pull",
+    )
+    parser.add_argument("--site", metavar="NAME", help="site name from ~/.config/hpc-tether/sites/*.toml")
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirmation token: pass only after the user has approved this "
+        "exact write in this exchange",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite an existing remote file that has no manifest entry "
+        "(drift cannot be assessed) — still backed up first",
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=600, metavar="SEC",
+        help="scp time limit (default 600)",
+    )
+    args = parser.parse_args(argv)
+
+    local = Path(args.local).expanduser()
+    if not local.is_file():
+        print(f"hpc-push: no such local file: {local}", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    try:
+        target = site_mod.load(args.site)
+    except site_mod.SiteError as exc:
+        print(f"hpc-push: {exc}", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    entry = manifest.lookup(local)
+
+    if args.to:
+        raw = args.to
+        if raw.startswith("/"):
+            remote_path = raw
+        elif ":" in raw:
+            role, _, rest = raw.partition(":")
+            try:
+                remote_path = target.path(role).rstrip("/") + "/" + rest
+            except site_mod.SiteError as exc:
+                print(f"hpc-push: {exc}", file=sys.stderr)
+                return transport.EXIT_USAGE
+        else:
+            print(
+                f"hpc-push: --to {raw!r} is neither absolute nor role:relative",
+                file=sys.stderr,
+            )
+            return transport.EXIT_USAGE
+    elif entry:
+        if entry["site"] != target.name:
+            print(
+                f"hpc-push: manifest entry for {local} belongs to site "
+                f"{entry['site']!r}, not {target.name!r}; pass --to or --site",
+                file=sys.stderr,
+            )
+            return transport.EXIT_USAGE
+        remote_path = entry["remote_path"]
+    else:
+        print(
+            f"hpc-push: no manifest entry for {local} and no --to given.\n"
+            "Either pull the file first (hpc-pull records the destination) or "
+            "name the destination explicitly with --to.",
+            file=sys.stderr,
+        )
+        return transport.EXIT_USAGE
+
+    if not target.allows("prepare"):
+        return _refuse(target, remote_path,
+                       profile_mod.refusal(target, "prepare", "a push"),
+                       f"needs profile prepare, site is at {target.profile}",
+                       transport.EXIT_GUARD)
+
+    # The floor, checked locally before anything is sent or approved: the
+    # destination is in a write root, and no code lands in a script root.
+    why = confine.push_refusal(remote_path, confine.site_context(target))
+    if why:
+        return _refuse(target, remote_path, f"REFUSED — {why}",
+                       "forbidden at every profile", transport.EXIT_GUARD)
+
+    # --- precheck + backup on the remote -----------------------------------
+    try:
+        scratch = target.path("scratch")
+    except site_mod.SiteError:
+        scratch = None
+    backup_dir = f"{scratch.rstrip('/')}/hpc-tether-backups" if scratch else ""
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    # The stamp alone resolves to one second, so two pushes of the same file in
+    # the same second produced the same backup name and the second silently
+    # overwrote the first. The local content hash disambiguates them, and the
+    # commit script refuses to overwrite an existing backup regardless.
+    backup_name = f"{Path(remote_path).name}.{stamp}.{_sha256(local)[:8]}"
+
+    quoted = shlex.quote(remote_path)
+    script = f"set -- {quoted}\n{_PRECHECK_SCRIPT}"
+
+    try:
+        result = transport.run_capture(target, script, timeout=120,
+                                       audit_extra={"step": "precheck"})
+    except transport.TransportError as exc:
+        print(f"hpc-push: {exc}", file=sys.stderr)
+        return exc.code
+    if result.returncode != 0:
+        if result.stderr.strip():
+            print(result.stderr.rstrip(), file=sys.stderr)
+        print(f"hpc-push: remote precheck failed (exit {result.returncode})",
+              file=sys.stderr)
+        return result.returncode
+
+    lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+    remote_state = lines[0] if lines else ""
+    git_state = lines[1] if len(lines) > 1 else "GIT_ERROR"
+
+    if git_state == "TRACKED":
+        return _refuse(
+            target, remote_path,
+            f"REFUSED — git tracks {target.host}:{remote_path}.\n"
+            "Tracked files sync only through git, so the checkout never "
+            "diverges from its history: commit the change locally, push it to "
+            "the remote repository, then `git pull` the cluster checkout "
+            "(reference/git-sync.md). No file was sent.",
+            "git tracks it", transport.EXIT_GUARD)
+    if git_state != "UNTRACKED":
+        why = ("there is no git on the cluster's PATH" if git_state == "GIT_UNAVAILABLE"
+               else "git failed in the destination's directory")
+        return _refuse(
+            target, remote_path,
+            f"REFUSED — {why}, so whether git tracks "
+            f"{target.host}:{remote_path} is unknown, and a tracked file is never "
+            "overwritten by a push. No file was sent. Check "
+            "`git status` in that directory on the cluster (reference/setup.md "
+            "covers git on the cluster).",
+            "git tracking unknown", transport.EXIT_GUARD)
+
+    if remote_state == "MISSING":
+        pass  # new remote file: nothing to drift against, nothing to back up
+    elif entry:
+        if remote_state != entry["sha256"]:
+            return _refuse(
+                target, remote_path,
+                f"REFUSED — {target.host}:{remote_path} changed since "
+                "it was pulled.\n"
+                f"  pulled sha256 : {entry['sha256']}\n"
+                f"  current sha256: {remote_state}\n"
+                "The remote edit may be the only copy of someone's work. "
+                "Re-pull, reconcile locally, then push again.",
+                "the remote changed since the pull", EXIT_REFUSED)
+    elif not args.force:
+        return _refuse(
+            target, remote_path,
+            f"REFUSED — {target.host}:{remote_path} exists but has "
+            "no manifest entry, so drift cannot be assessed.\n"
+            "Pull it first (hpc-pull, then re-apply your edit), or pass "
+            "--force to overwrite anyway (the file is still backed up before "
+            "it is replaced).",
+            "exists, never pulled", EXIT_REFUSED)
+
+    # The token comes after the read-only precheck, so the user is never
+    # asked to approve a push that would be refused anyway (and a tracked
+    # file is refused for being tracked, not for a missing --yes).
+    if not args.yes:
+        action = ("create" if remote_state == "MISSING"
+                  else "replace (the current copy is backed up first)")
+        return _refuse(
+            target, remote_path,
+            f"refusing without --yes. The checks passed; this would "
+            f"{action} {target.host}:{remote_path}.\n"
+            "--yes is a confirmation token: pass it only after the user has "
+            "approved this exact write.",
+            "no --yes; the checks passed", transport.EXIT_GUARD)
+
+    # --- transfer to a temp file beside the destination ---------------------
+    # Uploading onto the destination directly meant an interrupted scp, a full
+    # quota, or a dropped connection left it truncated -- with no second party
+    # needed for that to happen. The bytes land beside it instead and are
+    # renamed into place only once they are all there.
+    tmp_path = f"{remote_path}.hpc-push.{os.getpid()}.{stamp}"
+    remote = f"{target.host}:{shlex.quote(tmp_path)}"
+    argv_scp = ["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                str(local), remote]
+    detail = f"{local} -> {remote} (for {remote_path})"
+    with audit.Timer() as clock:
+        try:
+            proc = subprocess.run(argv_scp, timeout=args.timeout, check=False)
+        except subprocess.TimeoutExpired:
+            audit.record("scp", target.name, target.host, detail, transport.EXIT_TIMEOUT,
+                         seconds=args.timeout)
+            print(f"hpc-push: scp exceeded {args.timeout}s", file=sys.stderr)
+            _report_temp(target, tmp_path)
+            return transport.EXIT_TIMEOUT
+    extra = None
+    if proc.returncode == 0:
+        extra = audit.transfer_fields("out", 1, local.stat().st_size, remote_path, local)
+    audit.record("scp", target.name, target.host, detail, proc.returncode,
+                 seconds=clock.seconds, extra=extra)
+    if proc.returncode != 0:
+        print(f"hpc-push: scp failed with exit {proc.returncode}", file=sys.stderr)
+        _report_temp(target, tmp_path)
+        return transport.EXIT_SSH_FAILURE
+
+    # --- commit: re-verify, back up, atomic rename --------------------------
+    commit_args = [remote_path, tmp_path, remote_state or "MISSING",
+                   backup_dir, backup_name]
+    quoted = " ".join(shlex.quote(a) for a in commit_args)
+    commit = f"set -- {quoted}\n{_COMMIT_SCRIPT}"
+    try:
+        result = transport.run_capture(target, commit, timeout=180,
+                                       audit_extra={"step": "commit"})
+    except transport.TransportError as exc:
+        print(f"hpc-push: {exc}", file=sys.stderr)
+        print(f"hpc-push: uploaded file left at {tmp_path} — the destination "
+              "was NOT modified", file=sys.stderr)
+        return exc.code
+
+    out_lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+    conflict = next((l for l in out_lines if l.startswith("CONFLICT ")), None)
+    if result.returncode == EXIT_REFUSED or conflict:
+        found = conflict.removeprefix("CONFLICT ") if conflict else "unknown"
+        if result.stderr.strip():
+            print(result.stderr.rstrip(), file=sys.stderr)
+        print(
+            f"hpc-push: REFUSED — {target.host}:{remote_path} changed while the "
+            "file was uploading.\n"
+            f"  expected sha256: {remote_state}\n"
+            f"  current  sha256: {found}\n"
+            "The remote was left untouched and the uploaded temp file was left "
+            "beside it (path above; this toolkit never deletes). That edit "
+            "may be the only copy of someone's work — re-pull, reconcile "
+            "locally, then push again.",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+    if result.returncode != 0 or "COMMITTED" not in out_lines:
+        if result.stderr.strip():
+            print(result.stderr.rstrip(), file=sys.stderr)
+        print(f"hpc-push: remote commit failed (exit {result.returncode}); "
+              f"the destination was NOT modified", file=sys.stderr)
+        return result.returncode or transport.EXIT_SSH_FAILURE
+
+    backup_line = next((l for l in out_lines if l.startswith("BACKUP ")), None)
+
+    # --- record the new state ----------------------------------------------
+    size = local.stat().st_size
+    manifest.record(local, target.name, remote_path, size, int(time.time()))
+
+    print(f"pushed {local} -> {target.host}:{remote_path}")
+    if backup_line:
+        print(f"previous remote copy saved: {backup_line.removeprefix('BACKUP ')}")
+    elif remote_state == "MISSING":
+        print("remote file was new; no backup needed.")
+    elif not backup_dir:
+        print(
+            "note: site defines no scratch role, so no remote backup was taken.",
+            file=sys.stderr,
+        )
+    return transport.EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""Fetch a remote directory tree to the local machine over the ControlMaster.
+
+The directory counterpart of hpc-pull. It exists so that "grab these case
+folders" never again needs a hand-written fetch script: such a script shells
+out to scp or rsync from inside Python, which neither the Bash-tool hook nor
+the payload guard can see, and it accumulates as an unreviewed second
+transport. This verb is that transport, reviewed once.
+
+It moves bytes in ONE direction, cluster -> local, and never deletes:
+
+  * the remote is read with one bounded ``find`` (``--max-depth``, default 4)
+    that lists every regular file with its size -- so the count and total are
+    known before anything is transferred, and printed;
+  * the transfer is ``rsync -a`` over the master, argv list, never
+    ``--delete`` in any spelling, source always the remote;
+  * a destination that already holds files is refused without ``--merge``,
+    because rsync into it would overwrite local edits;
+  * the skill's own tree and any temp/scratchpad directory are refused as a
+    destination, as hpc-pull refuses them;
+  * the session transfer budget (hpctether/budget.py) applies on top of the
+    per-call caps: a fetch that would take this session's inbound total past
+    its budget exits 77 until the user agrees to ``--budget-add SIZE``;
+  * total size above 2 GiB needs ``--force-size``; file count above 2000
+    needs ``--max-files N``. Both caps are measured after ``--exclude``,
+    with rsync's matching rules (rule spellings like ``+ PAT`` are refused;
+    ``tests/exclude_parity.py`` checks the model against a real rsync), so
+    excluding the one huge file is how to fetch the rest of a tree -- not a
+    loop of hpc-pull. Condense on the
+    cluster first when what remains is still bigger than that -- an `ncra`
+    over a glob is one submission, a 40 GB pull is a day of the link.
+
+A manifest entry is recorded for the directory (remote path, file count,
+bytes, fetched_at) so hpc-push can refuse to push a file whose parent tree
+came down this way with a stale record, and so the audit log has the
+provenance.
+
+Exit codes:
+    0    fetched and recorded (or --dry-run listing printed)
+    64   usage error or unknown site/role, or a refused destination
+    65   refused: over the size cap (--force-size), over the file cap
+         (--max-files), or destination not empty (--merge)
+    66   remote directory missing or unreadable
+    69   no ControlMaster socket
+    77   would exceed the session transfer budget (hpctether/budget.py;
+         pass --budget-add SIZE once the user agrees); nothing was sent
+    124  timeout
+    255  ssh/rsync transport failure
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import shlex
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the installed skill
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hpctether import audit, budget, manifest
+from hpctether import site as site_mod
+from hpctether import transport
+
+EXIT_REFUSED = 65
+EXIT_NOINPUT = 66
+DEFAULT_MAX_BYTES = 2 * 1024**3
+DEFAULT_MAX_FILES = 2000
+DEFAULT_MAX_DEPTH = 4
+
+_TEMP_PREFIXES = (
+    "/tmp/", "/private/tmp/", "/var/tmp/", "/private/var/tmp/",
+    "/var/folders/", "/private/var/folders/",
+)
+
+# One bounded walk. `-printf` is GNU find, which every SLURM cluster this
+# toolkit targets runs. Output: "<bytes> <relative path>" per regular file,
+# then a ###DIRS### section with the top-level entries for the summary.
+_LIST_SCRIPT = """
+d="$1"; depth="$2"
+if [ ! -d "$d" ] || [ ! -r "$d" ]; then
+  echo "hpc-fetch: not a readable directory: $d" >&2
+  exit 66
+fi
+echo "###FILES###"
+find "$d" -maxdepth "$depth" -type f -printf '%s %P\\n'
+echo "###TOP###"
+find "$d" -mindepth 1 -maxdepth 1 -printf '%y %P\\n' | sort -k2
+"""
+
+
+def _resolve(target: site_mod.Site, raw: str) -> str:
+    return target.remote_path(raw).rstrip("/") or "/"
+
+
+def _human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def parse_listing(stdout: str) -> tuple[list[tuple[int, str]], list[tuple[str, str]]]:
+    """Return ([(bytes, relpath)], [(type, name)]) from the listing script."""
+    files: list[tuple[int, str]] = []
+    top: list[tuple[str, str]] = []
+    section = None
+    for line in stdout.splitlines():
+        s = line.strip()
+        if s == "###FILES###":
+            section = "files"
+            continue
+        if s == "###TOP###":
+            section = "top"
+            continue
+        if not s or section is None:
+            continue
+        if section == "files":
+            size_s, _, rel = line.partition(" ")
+            try:
+                files.append((int(size_s), rel))
+            except ValueError:
+                continue
+        else:
+            kind, _, name = line.partition(" ")
+            top.append((kind, name))
+    return files, top
+
+
+def _glob_regex(pattern: str) -> str:
+    """rsync wildcards as a regex: `*` stops at `/`, `**` does not."""
+    out, i = [], 0
+    while i < len(pattern):
+        c = pattern[i]
+        if pattern.startswith("/***", i) and i + 4 == len(pattern):
+            out.append("(/.*)?")  # rsync: "dir/***" is dir and all below it
+            i += 4
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif c == "*":
+            out.append("[^/]*")
+            i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        elif c == "[":
+            end = pattern.find("]", i + 2)
+            if end == -1:
+                out.append(re.escape(c))
+                i += 1
+            else:
+                body = pattern[i + 1:end]
+                if body.startswith("!"):
+                    body = "^" + body[1:]
+                out.append("[" + body.replace("\\", "\\\\") + "]")
+                i = end + 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return "".join(out)
+
+
+def _matcher(pattern: str):
+    """One rsync exclude pattern as a predicate on (relpath, is_dir).
+
+    The rsync rules this models: a trailing `/` matches directories only; a
+    leading `/` anchors at the transfer root; a pattern with no `/` (and no
+    `**`) matches the last path component at any depth; any other pattern
+    matches the full path or a trailing run of whole components of it.
+    """
+    dir_only = pattern.endswith("/") and pattern != "/"
+    body = pattern.rstrip("/") if dir_only else pattern
+    anchored = body.startswith("/")
+    body = body.lstrip("/") if anchored else body
+    regex = re.compile(_glob_regex(body) + r"\Z")
+    by_name = not anchored and "/" not in body and "**" not in body
+
+    def match(rel: str, is_dir: bool) -> bool:
+        if dir_only and not is_dir:
+            return False
+        if by_name:
+            return bool(regex.match(rel.rsplit("/", 1)[-1]))
+        if anchored:
+            return bool(regex.match(rel))
+        parts = rel.split("/")
+        return any(regex.match("/".join(parts[k:])) for k in range(len(parts)))
+
+    return match
+
+
+#: rsync reads `- PAT`, `+ PAT` (with optional modifiers, `_` for the space)
+#: and a lone `!` inside --exclude as filter rules, not patterns. An include
+#: would put back what the sizing already dropped, so refuse them outright.
+_RULE_PREFIX = re.compile(r"[+-][!/CenwxsrpE]*[ _]")
+
+
+def unsupported_exclude(pattern: str) -> str | None:
+    """A refusal message when rsync would read `pattern` as a filter rule."""
+    if pattern == "!" or _RULE_PREFIX.match(pattern):
+        return (
+            f"--exclude {pattern!r} would be read by rsync as a filter rule "
+            "('+ ', '- ' or '!'), which the size check does not model. Pass "
+            "the bare pattern instead."
+        )
+    return None
+
+
+def apply_excludes(
+    files: list[tuple[int, str]], excludes: list[str]
+) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+    """Split the listing into (kept, excluded) the way rsync's excludes will.
+
+    A file is excluded when it matches a pattern or any directory above it
+    does -- rsync never descends into an excluded directory. The caps are
+    measured on what is kept, so `--exclude` is how to fetch the small part
+    of an oversized tree.
+    """
+    matchers = [_matcher(p) for p in excludes if p]
+    if not matchers:
+        return list(files), []
+    kept: list[tuple[int, str]] = []
+    dropped: list[tuple[int, str]] = []
+    for size, rel in files:
+        parts = rel.split("/")
+        hit = any(m(rel, False) for m in matchers) or any(
+            m("/".join(parts[:k]), True) for k in range(1, len(parts)) for m in matchers
+        )
+        (dropped if hit else kept).append((size, rel))
+    return kept, dropped
+
+
+def check_limits(
+    files: list[tuple[int, str]], max_bytes: int, max_files: int, force_size: bool
+) -> str | None:
+    """A refusal message, or None if the tree is within bounds."""
+    total = sum(b for b, _ in files)
+    if len(files) > max_files:
+        return (
+            f"{len(files)} files exceeds the cap of {max_files}. Narrow the "
+            "directory, lower --max-depth, or raise --max-files if you mean it."
+        )
+    if total > max_bytes and not force_size:
+        return (
+            f"{_human(total)} exceeds the {_human(max_bytes)} cap. Condense on "
+            "the cluster first, or pass --force-size to pull it anyway."
+        )
+    return None
+
+
+def landed(dst: Path, files: list[tuple[int, str]], remote_dir: str) -> dict:
+    """Transfer fields for what is actually on disk after the rsync.
+
+    Measured from the listed files as they now sit under ``dst`` -- so a
+    partial transfer counts what arrived, and files already in a --merge
+    destination but not in the listing are not counted.
+    """
+    count = nbytes = 0
+    for _, rel in files:
+        p = dst / rel
+        if p.is_file():
+            count += 1
+            nbytes += p.stat().st_size
+    return audit.transfer_fields("in", count, nbytes, remote_dir, dst)
+
+
+def refuse_destination(dst: Path, skill_root: Path, merge: bool) -> str | None:
+    """A refusal message for a destination this tool must not write, or None."""
+    resolved = dst.resolve()
+    text = str(resolved)
+    if resolved == skill_root or skill_root in resolved.parents:
+        return (
+            f"refusing to write into the skill directory ({skill_root}). "
+            "Fetched data belongs in the working repo; pass an explicit "
+            "destination."
+        )
+    if text.startswith(_TEMP_PREFIXES) or "/scratchpad/" in text:
+        return (
+            f"refusing a temp or scratchpad destination ({resolved}). Pull "
+            "into the repo or working directory the session started in."
+        )
+    if resolved.exists():
+        if not resolved.is_dir():
+            return f"{resolved} exists and is not a directory."
+        if any(resolved.iterdir()) and not merge:
+            return (
+                f"{resolved} already holds files. rsync into it would "
+                "overwrite local edits; pass --merge if that is intended, "
+                "or name an empty destination."
+            )
+    return None
+
+
+def rsync_argv(host: str, remote_dir: str, dst: Path, excludes: list[str]) -> list[str]:
+    """The rsync command. Read direction only; no --delete in any form."""
+    argv = [
+        "rsync", "-a", "--no-owner", "--no-group", "--safe-links",
+        "-e", "ssh -o BatchMode=yes -o ConnectTimeout=10",
+    ]
+    for pattern in excludes:
+        argv += ["--exclude", pattern]
+    argv += [f"{host}:{shlex.quote(remote_dir)}/", str(dst) + "/"]
+    assert not any(a.startswith("--delete") for a in argv)
+    return argv
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(allow_abbrev=False, 
+        prog="hpc-fetch",
+        description=(
+            "Fetch a remote directory tree locally: list and size it first, "
+            "then rsync it down. Read direction only; never deletes."
+        ),
+        epilog=(
+            "Exit: 0 ok, 64 usage/refused destination, 65 over a cap or "
+            "destination not empty, 66 remote dir missing, 69 no master, "
+            "77 over the session transfer budget, 124 timeout, 255 transport "
+            "failure."
+        ),
+    )
+    parser.add_argument("src", metavar="SRC", help="remote directory: absolute or role:relative")
+    parser.add_argument(
+        "dst", metavar="DST", nargs="?",
+        help="local destination directory (default: ./<basename of SRC>)",
+    )
+    parser.add_argument("--site", metavar="NAME", help="site name from ~/.config/hpc-tether/sites/*.toml")
+    parser.add_argument(
+        "--max-depth", type=int, default=DEFAULT_MAX_DEPTH, metavar="N",
+        help=f"how deep to list and fetch (default {DEFAULT_MAX_DEPTH})",
+    )
+    parser.add_argument(
+        "--max-files", type=int, default=DEFAULT_MAX_FILES, metavar="N",
+        help=f"refuse a tree with more files than this (default {DEFAULT_MAX_FILES})",
+    )
+    parser.add_argument(
+        "--force-size", action="store_true",
+        help=f"fetch even above the {_human(DEFAULT_MAX_BYTES)} cap",
+    )
+    parser.add_argument(
+        "--merge", action="store_true",
+        help="allow a destination that already holds files (rsync overwrites "
+        "same-named local files)",
+    )
+    parser.add_argument(
+        "--exclude", action="append", default=[], metavar="PATTERN",
+        help="rsync exclude pattern (repeatable). Excluded files do not count "
+        "against the size or file cap, so this is how to fetch the small part "
+        "of an oversized tree",
+    )
+    parser.add_argument(
+        "--budget-add", metavar="SIZE",
+        help="raise this session's transfer budget by SIZE (e.g. 10G); pass "
+        "only after the user agrees",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="list and size the tree, then stop without transferring",
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=1800, metavar="SEC",
+        help="rsync time limit (default 1800)",
+    )
+    args = parser.parse_args(argv)
+
+    if args.max_depth <= 0 or args.max_files <= 0 or args.timeout <= 0:
+        print("hpc-fetch: --max-depth, --max-files and --timeout must be positive",
+              file=sys.stderr)
+        return transport.EXIT_USAGE
+    try:
+        add = budget.parse_size(args.budget_add) if args.budget_add else 0
+    except ValueError as exc:
+        print(f"hpc-fetch: --budget-add: {exc}", file=sys.stderr)
+        return transport.EXIT_USAGE
+    for pattern in args.exclude:
+        why = unsupported_exclude(pattern)
+        if why:
+            print(f"hpc-fetch: {why}", file=sys.stderr)
+            return transport.EXIT_USAGE
+
+    try:
+        target = site_mod.load(args.site)
+        remote_dir = _resolve(target, args.src)
+    except site_mod.SiteError as exc:
+        print(f"hpc-fetch: {exc}", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    dst = Path(args.dst).expanduser() if args.dst else Path(Path(remote_dir).name)
+    skill_root = Path(__file__).resolve().parent.parent
+    why = refuse_destination(dst, skill_root, args.merge)
+    if why:
+        print(f"hpc-fetch: {why}", file=sys.stderr)
+        return EXIT_REFUSED if "already holds" in why else transport.EXIT_USAGE
+
+    # --- list and size on the remote ---------------------------------------
+    quoted = " ".join(shlex.quote(a) for a in (remote_dir, str(args.max_depth)))
+    script = f"set -- {quoted}\n{_LIST_SCRIPT}"
+    try:
+        result = transport.run_capture(target, script, timeout=300)
+    except transport.TransportError as exc:
+        print(f"hpc-fetch: {exc}", file=sys.stderr)
+        return exc.code
+    if result.returncode == EXIT_NOINPUT:
+        print(result.stderr.strip(), file=sys.stderr)
+        return EXIT_NOINPUT
+    if result.returncode != 0:
+        if result.stderr.strip():
+            print(result.stderr.rstrip(), file=sys.stderr)
+        print(f"hpc-fetch: remote listing failed (exit {result.returncode})",
+              file=sys.stderr)
+        return result.returncode
+
+    files, top = parse_listing(result.stdout)
+    files, dropped = apply_excludes(files, args.exclude)
+    total = sum(b for b, _ in files)
+    print(f"{target.host}:{remote_dir}  (depth <= {args.max_depth})")
+    print(f"  {len(files)} files, {_human(total)}")
+    if dropped:
+        print(f"  (excluded: {len(dropped)} files, "
+              f"{_human(sum(b for b, _ in dropped))} -- not counted, not fetched)")
+    for kind, name in top[:40]:
+        print(f"    {'d' if kind == 'd' else '-'} {name}")
+    if len(top) > 40:
+        print(f"    ... and {len(top) - 40} more top-level entries")
+
+    why = check_limits(files, DEFAULT_MAX_BYTES, args.max_files, args.force_size)
+    if why:
+        print(f"hpc-fetch: REFUSED — {why}", file=sys.stderr)
+        return EXIT_REFUSED
+
+    if args.dry_run:
+        standing = budget.session_totals()
+        print(budget.status_line(standing))
+        if standing and standing["in_bytes"] + total > standing["budget"] + add:
+            print(f"  this fetch would exceed the session budget: it needs "
+                  f"--budget-add of at least "
+                  f"{_human(standing['in_bytes'] + total - standing['budget'])}")
+        print("dry run: nothing transferred.")
+        return transport.EXIT_OK
+
+    why = budget.admit(target, total, add, "fetch")
+    if why:
+        print(f"hpc-fetch: REFUSED — {why}", file=sys.stderr)
+        return transport.EXIT_GUARD
+
+    # --- transfer -----------------------------------------------------------
+    dst.mkdir(parents=True, exist_ok=True)
+    rsync = rsync_argv(target.host, remote_dir, dst, args.exclude)
+    if args.max_depth < 64:
+        # rsync has no depth flag; exclude everything below the listed depth so
+        # what lands matches what was sized.
+        rsync[-2:-2] = ["--exclude", "/" + "*/" * args.max_depth + "**"]
+    detail = f"{rsync[-2]} -> {rsync[-1]} ({len(files)} files, {_human(total)})"
+    with audit.Timer() as clock:
+        try:
+            proc = subprocess.run(rsync, timeout=args.timeout, check=False)
+        except subprocess.TimeoutExpired:
+            audit.record("rsync", target.name, target.host, detail, transport.EXIT_TIMEOUT,
+                         seconds=args.timeout)
+            print(f"hpc-fetch: rsync exceeded {args.timeout}s; partial tree left at "
+                  f"{dst} (rerun with --merge to resume)", file=sys.stderr)
+            return transport.EXIT_TIMEOUT
+    audit.record("rsync", target.name, target.host, detail, proc.returncode,
+                 seconds=clock.seconds, extra=landed(dst, files, remote_dir))
+    if proc.returncode != 0:
+        print(f"hpc-fetch: rsync failed with exit {proc.returncode}; partial tree "
+              f"may be at {dst} (rerun with --merge to resume)", file=sys.stderr)
+        return transport.EXIT_SSH_FAILURE
+
+    manifest.record_dir(dst, target.name, remote_dir, len(files), total)
+    print(f"fetched {len(files)} files ({_human(total)}) -> {dst.resolve()}")
+    print(budget.status_line(budget.session_totals()))
+    return transport.EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

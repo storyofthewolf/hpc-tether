@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Read named remote files: tail, head, or grep — bounded, read-only.
+
+This is the verb for the most common remote operation, reading a log, with
+no hand-written script and no way to become a write or a traversal. Paths
+must be named; the one search it does is a ``*``/``?``/``[...]`` pattern in
+the last component of one directory (``rundir:case42/*.log``), which never
+descends into subdirectories; names are then printed relative to it.
+
+A ``*.gz`` file is read decompressed. ``--tail`` and ``--head`` read one file. ``--grep`` reads one file, several
+named files, or the files one pattern matches: at most ``--max-files`` of
+them (default 20) and ``--max-count`` matching lines per file (default 50
+when several), each line prefixed with its file name. With one file and no
+``--max-count``, every matching line is printed, as before.
+
+Paths may be absolute or ``role:relative/path``, where ``role`` is a key from
+the site's ``[paths]`` table (e.g. ``rundir:case42/atm.log``).
+
+Output is capped (``--max-bytes``, default 256 KB) so a runaway log cannot
+flood the caller.
+
+Exit codes:
+    0    read succeeded (grep with no matches also exits 0 and says so)
+    64   usage error or unknown site/role
+    66   remote file missing or unreadable (with several files: none was)
+    69   no ControlMaster socket
+    124  timeout
+    255  ssh transport failure
+"""
+
+from __future__ import annotations
+
+import argparse
+import shlex
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the installed skill
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hpctether import site as site_mod
+from hpctether import transport
+
+EXIT_NOINPUT = 66
+
+#: Bounds on a multi-file grep.
+DEFAULT_MAX_FILES = 20
+MAX_FILES_CEILING = 200
+DEFAULT_MAX_COUNT = 50
+
+#: Characters that make the last path component a pattern.
+_GLOB_CHARS = "*?["
+
+# Arguments, in order: mode, line count, byte cap, grep pattern, max files,
+# per-file match cap (0: none), glob (empty: none), then the paths (with a
+# glob: the one directory). Every path starts with "/" (Site.remote_path), and
+# every command that takes one gets `--` first.
+_SCRIPT = """
+# pipefail off: `head -c` truncation SIGPIPEs the producer by design.
+set +o pipefail
+mode="$1"; n="$2"; cap="$3"; pat="$4"; maxf="$5"; per="$6"; glob="$7"; shift 7
+case "$mode" in
+  tail|head)
+    p="$1"
+    if [ ! -f "$p" ] || [ ! -r "$p" ]; then
+      echo "hpc-read: not a readable file: $p" >&2
+      exit 66
+    fi
+    # A gzipped log (climate models often gzip them when a run ends) is read decompressed.
+    if [ "$mode" = tail ]; then
+      case "$p" in *.gz) gzip -cd -- "$p" | tail -n "$n" ;;
+                   *) tail -n "$n" -- "$p" ;; esac | head -c "$cap"
+    else
+      case "$p" in *.gz) gzip -cd -- "$p" | head -n "$n" ;;
+                   *) head -n "$n" -- "$p" ;; esac | head -c "$cap"
+    fi
+    ;;
+  grep)
+    if [ -n "$glob" ]; then
+      d="$1"
+      if [ ! -d "$d" ] || [ ! -r "$d" ]; then
+        echo "hpc-read: not a readable directory: $d" >&2
+        exit 66
+      fi
+      # The pattern is expanded here and only here: unquoted, with word
+      # splitting off, in one directory. From inside it, so the names grep
+      # prints are short; `--` keeps a name like `-n.log` a file name.
+      cd -- "$d"
+      shopt -s nullglob
+      IFS=
+      set -- $glob
+      unset IFS
+      shopt -u nullglob
+      if [ "$#" -eq 0 ]; then
+        echo "hpc-read: no file in $d matches $glob" >&2
+        exit 66
+      fi
+    fi
+    files=()
+    skipped=0
+    more=0
+    for f in "$@"; do
+      if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+        if [ -z "$glob" ]; then echo "hpc-read: not a readable file: $f" >&2; fi
+        skipped=$((skipped + 1))
+      elif [ "${#files[@]}" -ge "$maxf" ]; then
+        more=$((more + 1))
+      else
+        files+=("$f")
+      fi
+    done
+    if [ "${#files[@]}" -eq 0 ]; then
+      echo "hpc-read: no readable file to search" >&2
+      exit 66
+    fi
+    opts=(-n)
+    if [ "$#" -gt 1 ] || [ -n "$glob" ]; then opts+=(-H); fi
+    if [ "$per" -gt 0 ]; then opts+=(-m "$per"); fi
+    # rc must come from grep, not from `head`: `rc=$?` after a pipeline
+    # reads the LAST element, so grep's "no matches" (1) and its real errors
+    # (>1) were both swallowed. PIPESTATUS[0] is the producer's status.
+    # zgrep only when a file is gzipped: it reads plain files too, but slower.
+    g=grep
+    for f in "${files[@]}"; do case "$f" in *.gz) g=zgrep ;; esac; done
+    set +e
+    "$g" "${opts[@]}" -- "$pat" "${files[@]}" | head -c "$cap"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$rc" -eq 1 ]; then echo "(no matches)"; fi
+    if [ "$more" -gt 0 ]; then
+      echo "hpc-read: searched ${#files[@]} files; $more more not searched (raise --max-files, at most {ceiling})" >&2
+    fi
+    if [ -n "$glob" ] && [ "$skipped" -gt 0 ]; then
+      echo "hpc-read: $skipped matching entries are not readable files and were skipped" >&2
+    fi
+    if [ "$rc" -gt 1 ]; then exit "$rc"; fi
+    ;;
+esac
+""".replace("{ceiling}", str(MAX_FILES_CEILING))
+
+
+def resolve_path(target: site_mod.Site, raw: str) -> str:
+    """Resolve ``role:relative`` against the site's [paths]; pass absolutes."""
+    return target.remote_path(raw)
+
+
+def split_glob(path: str) -> "tuple[str, str] | None":
+    """``(directory, pattern)`` when the last component is a pattern.
+
+    Raises SiteError for a pattern anywhere else: the search stays inside
+    one named directory.
+    """
+    head, _, last = path.rpartition("/")
+    if any(c in head for c in _GLOB_CHARS):
+        raise site_mod.SiteError(
+            f"path {path!r}: a pattern may only be in the last component "
+            "(one directory, no recursion)")
+    if not any(c in last for c in _GLOB_CHARS):
+        return None
+    return (head or "/"), last
+
+
+def build_script(mode: str, count: int, cap: int, pattern: str, max_files: int,
+                 per_file: int, glob: str, paths: list[str]) -> str:
+    args = [mode, str(count), str(cap), pattern, str(max_files), str(per_file), glob, *paths]
+    return f"set -- {' '.join(shlex.quote(a) for a in args)}\n{_SCRIPT}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(allow_abbrev=False,
+        prog="hpc-read",
+        description="Read named remote files (tail/head one file; grep one or "
+        "several). Read-only, bounded.",
+        epilog=(
+            "Examples: hpc-read rundir:case42/atm.log --tail 50; "
+            "hpc-read 'rundir:case42/*.log' --grep ERROR; "
+            "hpc-read rundir:a/x.log rundir:b/x.log --grep=-nan. "
+            "Exit: 0 ok, 64 usage, 66 file missing, 69 no master, 124 timeout, "
+            "255 ssh failure."
+        ),
+    )
+    parser.add_argument(
+        "path",
+        nargs="+",
+        metavar="PATH",
+        help="absolute remote path, or role:relative/path from the site's "
+        "[paths]. Several PATHs, or a pattern in the last component "
+        "(quote it: 'rundir:case42/*.log'), only with --grep",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--tail", type=int, metavar="N", help="last N lines (default 200)")
+    mode.add_argument("--head", type=int, metavar="N", help="first N lines")
+    mode.add_argument("--grep", metavar="PATTERN",
+                      help="lines matching PATTERN (grep basic regex), numbered; "
+                      "with several files, prefixed with the file name. A "
+                      "pattern starting with - is written --grep=-PATTERN")
+    parser.add_argument(
+        "--max-files", type=int, default=DEFAULT_MAX_FILES, metavar="N",
+        help=f"--grep: search at most N files (default {DEFAULT_MAX_FILES}, "
+        f"at most {MAX_FILES_CEILING}); the rest are counted, not searched",
+    )
+    parser.add_argument(
+        "--max-count", type=int, metavar="N",
+        help=f"--grep: at most N matching lines per file (default "
+        f"{DEFAULT_MAX_COUNT} with several files, no limit with one)",
+    )
+    parser.add_argument("--site", metavar="NAME", help="site name from ~/.config/hpc-tether/sites/*.toml")
+    parser.add_argument(
+        "--max-bytes",
+        type=int,
+        default=256 * 1024,
+        metavar="B",
+        help="hard cap on returned bytes (default 262144)",
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=60, metavar="SEC", help="local timeout (default 60)"
+    )
+    args = parser.parse_args(argv)
+
+    if args.max_bytes <= 0 or args.timeout <= 0:
+        print("hpc-read: --max-bytes and --timeout must be positive", file=sys.stderr)
+        return transport.EXIT_USAGE
+    for n in (args.tail, args.head, args.max_count):
+        if n is not None and n <= 0:
+            print("hpc-read: line counts must be positive", file=sys.stderr)
+            return transport.EXIT_USAGE
+    if not 0 < args.max_files <= MAX_FILES_CEILING:
+        print(f"hpc-read: --max-files must be 1 to {MAX_FILES_CEILING}", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    try:
+        target = site_mod.load(args.site)
+        paths = [resolve_path(target, raw) for raw in args.path]
+        globs = [split_glob(p) for p in paths]
+    except site_mod.SiteError as exc:
+        print(f"hpc-read: {exc}", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    several = len(paths) > 1 or globs[0] is not None
+    if several and args.grep is None:
+        print("hpc-read: --tail and --head read one file; several files or a "
+              "pattern need --grep", file=sys.stderr)
+        return transport.EXIT_USAGE
+    if any(globs) and len(paths) > 1:
+        print("hpc-read: a pattern path must be the only PATH", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    glob = ""
+    if globs[0] is not None:
+        directory, glob = globs[0]
+        paths = [directory]
+
+    if args.grep is not None:
+        mode_name, count, pattern = "grep", 0, args.grep
+        per_file = args.max_count or (DEFAULT_MAX_COUNT if several else 0)
+    elif args.head is not None:
+        mode_name, count, pattern, per_file = "head", args.head, "", 0
+    else:
+        mode_name, count, pattern, per_file = "tail", args.tail or 200, "", 0
+
+    script = build_script(mode_name, count, args.max_bytes, pattern, args.max_files,
+                          per_file, glob, paths)
+
+    try:
+        result = transport.run_capture(target, script, timeout=args.timeout)
+    except transport.TransportError as exc:
+        print(f"hpc-read: {exc}", file=sys.stderr)
+        return exc.code
+
+    sys.stdout.write(result.stdout)
+    if result.stderr.strip():
+        print(result.stderr.rstrip(), file=sys.stderr)
+    if len(result.stdout.encode()) >= args.max_bytes:
+        print(
+            f"\nhpc-read: output truncated at {args.max_bytes} bytes "
+            "(raise --max-bytes or narrow the read)",
+            file=sys.stderr,
+        )
+    return result.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

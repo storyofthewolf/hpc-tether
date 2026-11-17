@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""Compare local, origin, and HPC-checkout git state side by side.
+
+REPORTS ONLY. This tool never pushes, pulls, fetches, merges, resets, or
+checks out anything, on either side. Reconciling divergence is a judgment call
+that belongs to the user -- see reference/git-sync.md.
+
+Which checkout to compare:
+
+    hpc-sync-status NAME     a site [repos] entry (local and remote paths)
+    hpc-sync-status --all    every [repos] entry, one ssh round trip
+    hpc-sync-status          the current directory against the `repo` path
+                             role (--repo PATH, --remote-role ROLE)
+
+For each checkout it reports the three commits, the cluster's branch, and what
+differs: uncommitted files on either side, local commits not pushed, a cluster
+checkout behind origin (a fast-forward pull would bring it up), a cluster
+commit origin does not have, a [repos] entry whose origins differ, or a
+pinned branch the checkout has left. The cluster checkout is compared with
+origin's copy of *its own* branch, so testing a feature branch on the
+cluster while working on main locally is not a disagreement.
+
+`origin/<branch>` is as fresh as the last local `git fetch`; this tool does
+not fetch.
+
+Exit codes:
+    0    everything agrees
+    1    something differs (divergence, ahead/behind, dirty, origin, pin)
+    64   usage error, unknown site or repo, or the local path is not a git repo
+    69   no ControlMaster socket
+    70   a remote path is not a git checkout, or git is unavailable there
+    124  local timeout
+    255  ssh transport failure
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shlex
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the installed skill
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hpctether import gitsync
+from hpctether import site as site_mod
+from hpctether import transport
+
+EXIT_DIFFER = 1
+EXIT_REMOTE_QUERY = 70
+
+#: Reads each path given as an argument; one block per path, so one payload
+#: covers --all. A path that is not a checkout reports ###ERROR### and the
+#: loop goes on: one bad entry must not hide the others.
+_REMOTE_SCRIPT = """
+command -v git >/dev/null 2>&1 || {
+  echo "hpc-sync-status: git not found on $HPC_HOST" >&2
+  exit 70
+}
+for p in "$@"; do
+  echo "###REPO### $p"
+  if ! cd -- "$p" 2>/dev/null; then
+    echo "###ERROR###"; echo "cannot cd to $p"; continue
+  fi
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "###ERROR###"; echo "$p is not a git checkout"; continue
+  fi
+  echo "###HEAD###"; git rev-parse HEAD 2>/dev/null || true
+  echo "###BRANCH###"; git rev-parse --abbrev-ref HEAD 2>/dev/null || true
+  echo "###SUBJECT###"; git log -1 --pretty=%s 2>/dev/null || true
+  echo "###DIRTY###"; git status --porcelain 2>/dev/null | wc -l || true
+  echo "###ORIGIN###"; git config --get remote.origin.url || true
+done
+"""
+
+
+def remote_script(paths: list[str]) -> str:
+    return f"set -- {' '.join(shlex.quote(p) for p in paths)}\n{_REMOTE_SCRIPT}"
+
+
+def _local_git(repo: Path, args: list[str]) -> tuple[int, str]:
+    """Run a local read-only git command. argv list; never shell=True."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    return proc.returncode, (proc.stdout or "").strip()
+
+
+def parse_remote(stdout: str) -> dict[str, dict]:
+    """``{path: {head, branch, subject, dirty, origin} or {error}}``."""
+    out: dict[str, dict] = {}
+    path = None
+    key = None
+    for line in stdout.splitlines():
+        s = line.strip()
+        if s.startswith("###REPO### "):
+            path = s[len("###REPO### "):]
+            out[path] = {}
+            key = None
+        elif s.startswith("###") and s.endswith("###") and path is not None:
+            key = s.strip("#").lower()
+            out[path][key] = ""
+        elif path is not None and key is not None:
+            prev = out[path][key]
+            out[path][key] = (prev + "\n" + line if prev else line).strip()
+    for state in out.values():
+        try:
+            state["dirty"] = int(state.get("dirty", "0") or 0)
+        except ValueError:
+            state["dirty"] = 0
+    return out
+
+
+def measure(name: str | None, local: Path, remote_path: str, hpc: dict,
+            pin: str | None = None) -> dict:
+    """Everything known about one checkout, and the list of what differs."""
+    rec: dict = {"name": name, "local": {"path": str(local)},
+                 "hpc": {"path": remote_path}, "origin": {}, "differs": []}
+    differs = rec["differs"]
+    code, _ = _local_git(local, ["rev-parse", "--is-inside-work-tree"])
+    if code != 0:
+        rec["error"] = f"{local} is not a git repository"
+        rec["error_side"] = "local"
+        return rec
+    _, branch = _local_git(local, ["rev-parse", "--abbrev-ref", "HEAD"])
+    _, head = _local_git(local, ["rev-parse", "HEAD"])
+    _, subject = _local_git(local, ["log", "-1", "--pretty=%s"])
+    _, dirty_raw = _local_git(local, ["status", "--porcelain"])
+    dirty = len([ln for ln in dirty_raw.splitlines() if ln.strip()])
+    _, origin_url = _local_git(local, ["config", "--get", "remote.origin.url"])
+    rec["local"].update(branch=branch, head=head, subject=subject, dirty_files=dirty,
+                        origin_url=origin_url or None)
+
+    up = f"origin/{branch}"
+    code, up_head = _local_git(local, ["rev-parse", up])
+    ahead = behind = None
+    if code == 0:
+        c, counts = _local_git(local, ["rev-list", "--left-right", "--count", f"{up}...HEAD"])
+        if c == 0 and len(counts.split()) == 2:
+            behind, ahead = (int(x) for x in counts.split())
+    rec["origin"].update(ref=up, head=up_head if code == 0 else None,
+                         local_ahead=ahead, local_behind=behind)
+
+    if "error" in hpc:
+        rec["error"] = hpc["error"] or "remote checkout unreadable"
+        rec["error_side"] = "hpc"
+        return rec
+    hpc_head, hpc_branch = hpc.get("head", ""), hpc.get("branch", "")
+    rec["hpc"].update(branch=hpc_branch, head=hpc_head, subject=hpc.get("subject", ""),
+                      dirty_files=hpc.get("dirty", 0), origin_url=hpc.get("origin") or None)
+
+    # The cluster checkout against origin's copy of its own branch.
+    hup = f"origin/{hpc_branch}"
+    hcode, hup_head = _local_git(local, ["rev-parse", hup])
+    hpc_behind = hpc_ahead = None
+    if hcode == 0 and hpc_head:
+        known, _ = _local_git(local, ["cat-file", "-e", f"{hpc_head}^{{commit}}"])
+        if known == 0:
+            c, counts = _local_git(local, ["rev-list", "--left-right", "--count",
+                                           f"{hup}...{hpc_head}"])
+            if c == 0 and len(counts.split()) == 2:
+                hpc_behind, hpc_ahead = (int(x) for x in counts.split())
+    rec["hpc"].update(ref=hup, ref_head=hup_head if hcode == 0 else None,
+                      behind=hpc_behind, ahead=hpc_ahead)
+
+    if dirty:
+        differs.append(f"local has {dirty} uncommitted file(s)")
+    if ahead:
+        differs.append(f"local has {ahead} commit(s) not pushed to {up}")
+    if behind:
+        differs.append(f"local is {behind} behind {up} (pull locally)")
+    if hcode != 0:
+        differs.append(f"origin has no branch {hpc_branch!r} as of the last local fetch")
+    elif hpc_ahead is None and hpc_head != hup_head:
+        differs.append(f"the cluster is at a commit the local clone doesn't have: "
+                       f"it was made on the cluster, or the local fetch is stale")
+    else:
+        if hpc_behind:
+            differs.append(f"cluster is {hpc_behind} behind {hup}: a fast-forward pull brings it up")
+        if hpc_ahead:
+            differs.append(f"cluster has {hpc_ahead} commit(s) not on {hup}: made on the cluster")
+    if hpc.get("dirty"):
+        differs.append(f"cluster has {hpc['dirty']} uncommitted file(s): edited on the cluster")
+    if origin_url and hpc.get("origin") and (
+            gitsync.normalize_url(origin_url) != gitsync.normalize_url(hpc["origin"])):
+        differs.append(f"origins differ (local {origin_url}, cluster {hpc['origin']}): "
+                       "these are different repositories")
+    if pin and hpc_branch != pin:
+        differs.append(f"pinned to {pin!r} but the cluster is on {hpc_branch!r}")
+    return rec
+
+
+def _short(sha) -> str:
+    return sha[:10] if sha else "(none)"
+
+
+def print_one(rec: dict, site_name: str, host: str) -> None:
+    title = f"{rec['name']}    " if rec["name"] else ""
+    loc, org, hpc = rec["local"], rec["origin"], rec["hpc"]
+    print(f"{title}site: {site_name}")
+    print()
+    print(f"  local   {_short(loc.get('head'))}  {loc.get('branch', '')}  {loc.get('subject', '')}")
+    print(f"          {loc['path']}")
+    print(f"  origin  {_short(org.get('head'))}  {org.get('ref', '')}")
+    if hpc.get("ref") and hpc.get("ref") != org.get("ref"):
+        print(f"          {_short(hpc.get('ref_head'))}  {hpc['ref']}  (the cluster's branch)")
+    print(f"  hpc     {_short(hpc.get('head'))}  {hpc.get('branch', '')}  {hpc.get('subject', '')}")
+    print(f"          {host}:{hpc['path']}")
+    print()
+
+
+def print_verdict(rec: dict) -> None:
+    if rec.get("error"):
+        print(f"  ERROR: {rec['error']}")
+    elif rec["differs"]:
+        for d in rec["differs"]:
+            print(f"  - {d}")
+    else:
+        print("  in sync")
+
+
+def print_row(rec: dict) -> None:
+    hpc = rec["hpc"]
+    head = f"{_short(hpc.get('head'))} {hpc.get('branch', '')}".strip()
+    if rec.get("error"):
+        state = f"ERROR: {rec['error']}"
+    elif rec["differs"]:
+        state = "; ".join(rec["differs"])
+    else:
+        state = "in sync"
+    print(f"  {rec['name']:<22} {head:<26} {state}")
+
+
+FOOTER = ("\nThis tool reports only. Reconciling is the user's call -- see "
+          "reference/git-sync.md. Push and pull are each separately "
+          "confirm-worthy; never force.")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(allow_abbrev=False, 
+        prog="hpc-sync-status",
+        description="Report local vs origin vs HPC-checkout git state. Never writes.",
+        epilog=(
+            "Exit: 0 all agree, 1 something differs, 64 usage/not a repo, 69 no master, "
+            "70 remote not a checkout, 124 timeout, 255 ssh failure."
+        ),
+    )
+    parser.add_argument("name", nargs="?", help="a site [repos] entry")
+    parser.add_argument("--all", action="store_true", help="every site [repos] entry")
+    parser.add_argument("--site", metavar="NAME", help="site name from ~/.config/hpc-tether/sites/*.toml")
+    parser.add_argument("--repo", metavar="PATH", default=".",
+                        help="local repo path, without NAME (default: current directory)")
+    parser.add_argument("--remote-role", metavar="ROLE", default="repo",
+                        help="site [paths] role holding the HPC checkout, without NAME (default: repo)")
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument("--timeout", type=int, default=60, metavar="SEC", help="local timeout")
+    args = parser.parse_args(argv)
+
+    if args.all and args.name:
+        print("hpc-sync-status: give NAME or --all, not both", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    try:
+        target = site_mod.load(args.site)
+    except site_mod.SiteError as exc:
+        print(f"hpc-sync-status: {exc}", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    # (name, local path, remote path, pinned branch)
+    jobs: list[tuple[str | None, Path, str, str | None]] = []
+    if args.all or args.name:
+        if not target.repos:
+            print(f"hpc-sync-status: site {target.name!r} has no [repos] table "
+                  "(see reference/git-sync.md); it is the user's to write", file=sys.stderr)
+            return transport.EXIT_USAGE
+        mirrored = {n: r for n, r in target.repos.items() if r.local}
+        names = sorted(mirrored) if args.all else [args.name]
+        if args.all and not names:
+            print(f"hpc-sync-status: no [repos] entry in site {target.name!r} gives a "
+                  "local checkout (local = \"...\"); there is nothing to compare",
+                  file=sys.stderr)
+            return transport.EXIT_USAGE
+        for n in names:
+            repo = target.repos.get(n)
+            if repo is None:
+                print(f"hpc-sync-status: no [repos] entry {n!r}; known: "
+                      f"{', '.join(sorted(target.repos))}", file=sys.stderr)
+                return transport.EXIT_USAGE
+            if not repo.local:
+                print(f"hpc-sync-status: [repos] {n!r} has no local checkout "
+                      "(no local = \"...\"), so there is nothing to compare; pass "
+                      "a local repo path instead", file=sys.stderr)
+                return transport.EXIT_USAGE
+            jobs.append((n, Path(repo.local), repo.remote, repo.branch))
+    else:
+        local = Path(args.repo).expanduser().resolve()
+        code, _ = _local_git(local, ["rev-parse", "--is-inside-work-tree"])
+        if code != 0:
+            print(f"hpc-sync-status: {local} is not a git repository", file=sys.stderr)
+            return transport.EXIT_USAGE
+        try:
+            jobs.append((None, local, target.path(args.remote_role), None))
+        except site_mod.SiteError as exc:
+            print(f"hpc-sync-status: {exc}", file=sys.stderr)
+            return transport.EXIT_USAGE
+
+    try:
+        result = transport.run_capture(
+            target, remote_script([j[2] for j in jobs]), timeout=args.timeout)
+    except transport.TransportError as exc:
+        print(f"hpc-sync-status: {exc}", file=sys.stderr)
+        return exc.code
+    if result.stderr.strip():
+        print(result.stderr.rstrip(), file=sys.stderr)
+    if result.returncode != 0:
+        return EXIT_REMOTE_QUERY if result.returncode == 70 else result.returncode
+
+    remote = parse_remote(result.stdout)
+    records = [measure(n, local, rp, remote.get(rp, {"error": "no answer from the cluster"}), pin)
+               for n, local, rp, pin in jobs]
+    ok = all(not r["differs"] and not r.get("error") for r in records)
+
+    if args.json:
+        print(json.dumps({"site": target.name, "host": target.host, "agree": ok,
+                          "repos": records}, indent=2))
+    elif args.all:
+        print(f"site: {target.name}    {len(records)} repos    (cluster head, branch, state)\n")
+        for rec in records:
+            print_row(rec)
+        if not ok:
+            print(FOOTER)
+    else:
+        rec = records[0]
+        print_one(rec, target.name, target.host)
+        print_verdict(rec)
+        if not ok:
+            print(FOOTER)
+
+    if len(records) == 1 and records[0].get("error"):
+        return EXIT_REMOTE_QUERY if records[0]["error_side"] == "hpc" else transport.EXIT_USAGE
+    return transport.EXIT_OK if ok else EXIT_DIFFER
+
+
+if __name__ == "__main__":
+    sys.exit(main())

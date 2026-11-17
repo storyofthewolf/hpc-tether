@@ -1,0 +1,100 @@
+# Template site file. Copy to ~/.config/hpc-tether/sites/<sitename>.toml
+# and edit; the file name (minus .toml) is the site name. The toolkit never
+# reads this template. Only you edit the copy; the agent never does.
+#
+# The file has five parts, in this order:
+#   header         which machine
+#   [policy]       what the agent may do there          -- decide this first
+#   [paths]        common paths in your work, by name
+#   [repos.NAME]   your code repositories on the cluster, one entry each
+#   [filesystem], [environment]   facts about the machine and your account
+#
+# `host` is a key into ~/.ssh/config and nothing more. Connection details --
+# user, port, identity file, ProxyCommand, ControlMaster -- live in ssh config,
+# which remains the single authority.
+
+name = "example"
+host = "cluster.example.edu"
+scheduler = "slurm"           # slurm only; see hpctether/site.py for why
+user = "yourusername"
+
+# ── Policy ────────────────────────────────────────────────────────────────
+[policy]
+# What the agent may do. Each level includes the ones above it:
+#   observe    fixed tools only: queue, logs, listings, probes, reads, pull and
+#              fetch; no free-form shell (the default)
+#   prepare    also free-form shell: reads, and writes inside the write roots;
+#              never starts a process
+#   operate    also run your trusted repos' scripts and control jobs
+#   improvise  also run code the agent writes itself, each payload shown to
+#              you for approval first
+profile = "observe"
+
+# Where the agent may write (always with your approval). The scratch path
+# below is always one. Two styles:
+#   sandbox: leave this out, or list one directory kept for the agent;
+#   broad:   list the directories you own, and fence off what must never
+#            change with `protected`.
+# The cluster's own permissions already stop writes to other people's files;
+# these roots also keep the agent out of shared group areas you can write to.
+# Absolute, no `..`, at least two levels deep. Nothing anywhere allows a
+# deletion: the toolkit never deletes on the cluster.
+# write_roots = ["/projects/yourgroup/yourusername"]
+
+# Never written, even inside a write root: a shared model tree, a reference
+# data set. Reading is unaffected.
+# protected = ["/projects/yourgroup/yourusername/models/stock"]
+
+# The most variable data one hpc-nc call may read, in MB (default 100). Past
+# it, the work belongs in a script in one of your repos.
+# nc_max_read_mb = 100
+
+# ── Common paths ──────────────────────────────────────────────────────────
+# Places you work in often, by a name you choose. Each is a shorthand for the
+# agent: `scratch` here is $HPC_SCRATCH inside a payload and `scratch:file` in
+# a tool argument. Naming a path grants nothing; [policy] decides writes.
+[paths]
+scratch = "/scratch/yourusername"
+work    = "/projects/yourgroup/yourusername"
+output  = "/projects/yourgroup/yourusername/output"
+
+# ── Repositories ──────────────────────────────────────────────────────────
+# One entry per code repository on the cluster. Only `remote` is required.
+#   remote   the checkout on the cluster
+#   local    your checkout on this machine, if you have one. With it,
+#            hpc-sync-status compares the two and the agent may run the sync
+#            operations of `mode` in the cluster checkout (reference/git-sync.md).
+#   mode     "pull-only" (default): fetch, pull --ff-only, switch <branch>;
+#            "two-way": also commit, push and merge on the cluster.
+#   branch   pins the cluster checkout to one branch.
+#   trusted  true: its .py files run with no token, whatever their arguments.
+#            You wrote and maintain this code; the guard cannot read inside
+#            it, so a script that deletes will delete.
+#   confirm  patterns over "<path in repo> <args>" that still need your
+#            approval, e.g. ["*submit.py *--execute*"]. This repo only.
+#   role     also name the checkout as a common path ("repo" -> $HPC_REPO).
+#
+# [repos.mymodel]
+# remote = "/home/yourusername/mymodel"
+# local  = "~/code/mymodel"
+# branch = "main"
+#
+# [repos.analysis]
+# remote  = "/home/yourusername/analysis"
+# trusted = true
+# role    = "repo"
+
+# ── The machine ───────────────────────────────────────────────────────────
+[filesystem]
+# What `~` means on the cluster, so `cd ~/code/x && python y.py` is recognized.
+home = "/home/yourusername"
+# Two spellings of one directory. Write confinement compares path text, so if
+# /home/YOU is a symlink to /gpfs/home/YOU, a write spelled one way would be
+# refused when the root is spelled the other. Check with `readlink -f`.
+# aliases = { "/home/yourusername" = "/gpfs/home/yourusername" }
+
+[environment]
+# bin/ of the Python environment payloads use ($HPC_PYTHON_BIN). A payload
+# runs in a non-interactive shell with no modules loaded; it starts with
+# export PATH="$HPC_PYTHON_BIN:$PATH" and calls bare `python`.
+# python_bin = "/opt/python/envs/py3.12/bin"

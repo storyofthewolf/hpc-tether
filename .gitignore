@@ -1,0 +1,7 @@
+.claude/settings.local.json
+.DS_Store
+__pycache__/
+*.pyc
+
+# Development notes, kept out of the repo
+notes/

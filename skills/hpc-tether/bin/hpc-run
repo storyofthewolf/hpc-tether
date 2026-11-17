@@ -1,0 +1,646 @@
+#!/usr/bin/env python3
+"""Run a bash script on a remote HPC by piping it to `bash -s` over ssh.
+
+This is the ONLY sanctioned path for free-form remote execution — and it is
+the escape hatch, not the default. Named operations have dedicated verbs
+(hpc-read, hpc-ls, hpc-jobs, hpc-probe, hpc-nc, hpc-pull, hpc-push,
+hpc-sync-status) that
+should be preferred whenever one fits.
+
+Interface rules, each closing a failure class that actually occurred:
+
+* **Stdin-first.** The normal form is ``... | hpc-run -``. A script *path* is
+  accepted only outside temp directories: paths under /tmp, /var/tmp, or an
+  agent scratchpad are refused, because "write a throwaway file, pass the
+  path" is how 31 orphaned hpc_*.sh files accumulated. A script worth keeping
+  belongs in the skill's lib/ under version control.
+
+* **No command strings.** A quoted one-liner is refused so no local shell
+  (often tcsh) ever parses anything on its way to the cluster.
+
+* **Guarded payloads.** Every script is classified by hpctether/guard.py
+  before anything is sent. Forbidden constructs (any deletion, mv outside
+  the writable roots, force pushes, unbounded traversals, ...) are refused
+  outright with exit 77.
+  Interpreter-tier constructs (python/perl, nested bash -c, eval, srun, make,
+  curl/wget/scp) need --allow-exec, because they run text the guard cannot
+  read and so escape every other check. Write-tier constructs need
+  --allow-write. Both flags are confirmation tokens: hpc-run refuses a
+  payload whose token is missing, and the plugin's approval hook asks the
+  user before any command that carries one.
+
+* **Profiles.** The site's ``profile`` (observe, prepare, operate,
+  improvise; see hpctether/profile.py) decides what may be sent at all,
+  before any token is considered. ``observe`` sends no free-form payload at
+  all (only the fixed tools run there). Writes need ``prepare``; trusted scripts and
+  job control (sbatch, scancel, kill) need ``operate``; inline code needs
+  ``improvise``. Script roots are inactive below ``operate``.
+
+* **Remote watchdog.** The payload runs under a remote `timeout` sized below
+  the local timeout, so a hung command dies on the cluster instead of
+  lingering as an orphan on a login node.
+
+* **Pre-built scripts.** A `.py` file in one of the site's trusted repos (script roots)
+  (repos the user wrote and maintains), run as `python [flags] FILE.py ARGS`
+  or directly, is read tier whatever its arguments -- unless it matches a
+  `script_confirm` pattern, which makes it write tier. Inline code
+  (`python -c`, `python - <<EOF`) and a `.py` outside every root stay
+  interpreter tier. The guard still cannot see inside the script, so one
+  that deletes will delete. `--no-trust` classifies as if no roots were
+  declared, for diagnosis.
+
+Exit codes:
+    0     the remote script succeeded
+    1-63  passed through unchanged from the remote script
+    64    usage error, unknown site, unreadable/temp-dir script path, or a
+          command string passed where a script was required
+    69    no ControlMaster socket (preflight; never ambiguous with remote)
+    77    guard or profile refusal; nothing was transmitted
+    78    a script root the payload uses is not a clean git checkout (modified
+          or untracked code, or not a checkout); checked on the cluster, and
+          nothing in the payload ran
+    79    a job named on one of the payload's sbatch lines is already queued or
+          running, or squeue failed; checked on the cluster, nothing ran
+    124   watchdog or local timeout (stderr says which; watchdog leaves
+          nothing running)
+    255   ssh transport failure
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the installed skill
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hpctether import guard
+from hpctether import profile as profile_mod
+from hpctether import site as site_mod
+from hpctether import audit, gitsync, transport, trust
+
+#: A bare word that is very likely a command, not a script path. Used only to
+#: produce a better error; ANY non-existent path is already rejected.
+_COMMANDISH = frozenset(
+    {
+        "ls", "cat", "tail", "head", "grep", "echo", "squeue", "sacct", "sbatch",
+        "scancel", "srun", "du", "df", "stat", "find", "module", "python",
+        "python3", "git", "rm", "mv", "cp", "chmod", "mkdir", "test", "which",
+        "sinfo", "scontrol", "awk", "sed", "wc", "ncdump", "bash", "sh",
+    }
+)
+
+#: Script paths under these prefixes are refused: throwaway files accumulate.
+#: `/var/folders/` is macOS's per-user temp root and is what $TMPDIR actually
+#: points at there -- so `mktemp` output landed outside this list and was
+#: accepted, which is the common way a throwaway script gets written at all.
+_TEMP_PREFIXES = (
+    "/tmp/", "/private/tmp/", "/var/tmp/", "/private/var/tmp/",
+    "/var/folders/", "/private/var/folders/",
+)
+
+
+def _looks_like_command(raw: str) -> bool:
+    """True if the argument reads as a command string rather than a path."""
+    stripped = raw.strip()
+    if not stripped:
+        return False
+    # Shell metacharacters never appear in a plausible script path we'd accept.
+    if any(ch in stripped for ch in "|&;<>$`*()\n"):
+        return True
+    parts = stripped.split()
+    if len(parts) > 1:
+        return True
+    return parts[0] in _COMMANDISH
+
+
+def _undefined_roles(script: str, target) -> list[str]:
+    """``$HPC_*`` names the payload uses that its prelude does not define.
+
+    An agent may guess a name such as ``$HPC_MYTOOLS`` for a repo whose role
+    is ``repo``. ``cd $HPC_MYTOOLS`` names no directory, so the trusted script
+    after it reads as unknown code, and the refusal would say "python executes
+    arbitrary source" without naming the real mistake. Under ``set -u`` the
+    payload would have failed on the cluster anyway.
+    """
+    defined = set(transport.FIXED_ROLES) | set(target.env())
+    assigned = set(re.findall(r"(?<![\w$])(HPC_[A-Za-z0-9_]+)=", script))
+    used = re.findall(r"\$\{?(HPC_[A-Za-z0-9_]+)", script)
+    return sorted({n for n in used if n not in defined and n not in assigned})
+
+
+def _read_script(raw: str) -> str:
+    """Read the script from a path or stdin. Raises SystemExit(64) on refusal."""
+    if raw == "-":
+        return sys.stdin.read()
+
+    path = Path(raw).expanduser()
+    resolved = str(path.resolve())
+    if resolved.startswith(_TEMP_PREFIXES) or "/scratchpad/" in resolved:
+        print(
+            f"hpc-run: refusing a script in a temp directory: {raw}\n"
+            "Throwaway script files accumulate and never get cleaned up.\n"
+            "Pipe the script on stdin instead:\n"
+            "\n"
+            "  printf '%s\\n' 'squeue -u \"$HPC_USER\"' | hpc-run -\n"
+            "\n"
+            "If this script is worth keeping, promote it into the skill's "
+            "lib/ directory under version control and pass that path.",
+            file=sys.stderr,
+        )
+        raise SystemExit(transport.EXIT_USAGE)
+    if path.is_file():
+        try:
+            return path.read_text()
+        except OSError as exc:
+            print(f"hpc-run: cannot read {path}: {exc}", file=sys.stderr)
+            raise SystemExit(transport.EXIT_USAGE) from None
+
+    if _looks_like_command(raw):
+        print(
+            f"hpc-run: refusing to run a command string: {raw!r}\n"
+            "hpc-run takes '-' (script on stdin) or a versioned script path --\n"
+            "never a quoted one-liner. This is what keeps a local shell from\n"
+            "parsing anything on its way to the cluster.\n"
+            "\n"
+            "  printf '%s\\n' 'squeue -u \"$HPC_USER\"' | hpc-run --dry-run -\n"
+            "  printf '%s\\n' 'squeue -u \"$HPC_USER\"' | hpc-run -",
+            file=sys.stderr,
+        )
+        raise SystemExit(transport.EXIT_USAGE)
+
+    print(
+        f"hpc-run: no such script: {path}\n"
+        "Pass '-' to read the script from stdin, or a readable script path.",
+        file=sys.stderr,
+    )
+    raise SystemExit(transport.EXIT_USAGE)
+
+
+def _print_violations(violations, header: str) -> None:
+    print(header, file=sys.stderr)
+    for v in violations:
+        print(f"  line {v.lineno}: {v.line}", file=sys.stderr)
+        print(f"    -> {v.message}", file=sys.stderr)
+
+
+#: Phrases in a refusal message that tell the agent a form which would be
+#: sent ("Add -k", "Pull the file ... edit it locally", "rewrite it as a
+#: literal absolute path"), as opposed to a command that is never sent.
+_FIX_HINT_RE = re.compile(r"\bAdd -|\bPull the file\b|\brewrite it\b|\buse a trusted script\b")
+
+
+def _forbidden_footer(violations) -> str:
+    """The closing note of a forbidden refusal. "These are the
+    user's to run by hand" would contradict a hint such as "Add -k". When any line
+    carries a fix hint, the hint comes first and the hand-run note covers
+    only the original form (and any line with no hint)."""
+    hinted = [v for v in violations if _FIX_HINT_RE.search(v.message)]
+    if not hinted:
+        return (
+            "\nNothing was transmitted. These are the user's to run by hand "
+            "in their own terminal; print the exact command for them instead."
+        )
+    return (
+        "\nNothing was transmitted. Apply the hint above and retry. Only if "
+        "the user wants the original form (or a line shows no hint) is it "
+        "theirs to run by hand in their own terminal; then print the exact "
+        "command for them."
+    )
+
+
+def _script_root_hint(target) -> str:
+    """Why a ``.py`` invocation was not treated as a pre-built script.
+
+    Most such refusals are a spelling the scan cannot resolve, not a script
+    outside the roots: ``cd ~/repo && python x.py`` is the common one."""
+    roots = "\n".join(f"    {r}" for r in target.script_roots) or "    (none declared)"
+    return (
+        "\nA .py file in one of the site's trusted repos runs with no token:\n"
+        f"{roots}\n"
+        "It is recognized only when its path is absolute, a site role "
+        "($HPC_REPO/x.py), `~/` (if the site sets [filesystem] home), or relative "
+        "directly after `cd <abs-role-or-~> &&` on the same line. `~user`, "
+        "other variables, globs and `..` are not resolved, nor is `~` in a "
+        "payload that assigns HOME. python -c / -m / `python - <<EOF` are inline code and stay "
+        "interpreter tier. Trusting a repo is the user's call, never a way "
+        "around this refusal."
+    )
+
+
+#: A heredoc that writes a file: `cat > f <<'EOF'`, `cat <<EOF > f`, `tee f <<EOF`.
+_HEREDOC_RE = re.compile(r"(?<!<)<<-?\s*(['\"]?)[A-Za-z_][A-Za-z0-9_]*\1(?!<)")
+
+
+def _writes_heredoc(script: str) -> bool:
+    for line in script.splitlines():
+        if not _HEREDOC_RE.search(line):
+            continue
+        rest = _HEREDOC_RE.sub(" ", line)
+        first = rest.split()[0] if rest.split() else ""
+        if ">" in rest or first in ("cat", "tee"):
+            return True
+    return False
+
+
+def _heredoc_hint() -> str:
+    """`cat > job.sh <<'EOF'` needs improvise, because the guard reads
+    heredoc lines, and the closing EOF, as commands. The refusal must point at the push, not a higher profile."""
+    return (
+        "\nThis payload writes a file from a heredoc. The guard does not read "
+        "heredocs: their lines and the closing delimiter are checked as "
+        "commands, so this refusal is about the heredoc, not the file. To "
+        "create or replace a file on the cluster, write it locally and send "
+        "it with `hpc-push LOCAL --to role:path --yes` (profile prepare; the "
+        "user approves the write, and a file it replaces is backed up). Do "
+        "not ask for a higher profile to write a file."
+    )
+
+
+def _apply_guard(
+    script: str, target, allow_write: bool, allow_exec: bool, roots=None,
+    inactive_roots=None,
+) -> "tuple[int | None, list, str | None, list, str | None]":
+    """Classify the script.
+
+    ``roots`` are the script roots in force; ``inactive_roots`` are the
+    site's roots when its profile is below ``operate`` and they are off. They
+    are used only to name the right level in a refusal: a trusted script
+    refused at ``prepare`` needs ``operate``, not ``improvise``.
+
+    Returns ``(exit_code_or_None, uses, needed_level, repo_writes,
+    refused_line)``. ``refused_line`` is the first line the refusal names,
+    for the audit's ``detail``: the payload's first line would mislead a reading
+    of the log (a ``df`` line shown as refused for a later line). The uses come from the report, not
+    from a second walk over the script, so the audit records exactly the
+    pre-built script invocations this classification allowed.
+    """
+    report = guard.classify(
+        script,
+        roots=target.guard_roots(),
+        scratch=target.paths.get("scratch"),
+        trust=roots,
+        paths=target.paths,
+        aliases=target.aliases,
+        script_roots=target.script_roots,
+        repos=target.repos,
+        protected=target.protected,
+    )
+
+    for note in report.notes:
+        print(f"hpc-run: note: {note}", file=sys.stderr)
+    needed = profile_mod.needed_for(report)
+
+    forbidden = report.of_kind(guard.FORBIDDEN)
+    traversal = report.of_kind(guard.TRAVERSAL)
+    # Unknown commands are gated exactly like interpreters: the guard can't
+    # read what they do.
+    interpreters = report.of_kind(guard.INTERPRETER) + report.of_kind(guard.UNKNOWN)
+    writes = report.of_kind(guard.WRITE)
+
+    if forbidden:
+        _print_violations(
+            forbidden,
+            "hpc-run: REFUSED — the payload contains operations this tool "
+            "never sends:",
+        )
+        print(_forbidden_footer(forbidden), file=sys.stderr)
+        return transport.EXIT_GUARD, [], None, [], forbidden[0].line
+
+    if traversal:
+        _print_violations(
+            traversal,
+            "hpc-run: REFUSED — unbounded filesystem traversal on a shared "
+            "filesystem:",
+        )
+        print(
+            "\nNothing was transmitted. Bound the walk (find -maxdepth, du -s, "
+            "explicit file lists) and retry.",
+            file=sys.stderr,
+        )
+        return transport.EXIT_GUARD, [], None, [], traversal[0].line
+
+    # The profile decides what may be sent at all, before any token: the
+    # agent must not ask the user to approve what the profile forbids.
+    if not target.allows(needed):
+        if needed == "improvise" and inactive_roots:
+            with_roots = guard.classify(
+                script,
+                roots=target.guard_roots(),
+                scratch=target.paths.get("scratch"),
+                trust=inactive_roots,
+                paths=target.paths,
+                aliases=target.aliases,
+        script_roots=target.script_roots,
+        repos=target.repos,
+        protected=target.protected,
+            )
+            needed = profile_mod.needed_for(with_roots)
+            # Describe the payload as the higher level would see it: a trusted
+            # script there needs no token, so the roots-off messages
+            # ("needs --allow-exec") would point the wrong way.
+            interpreters = (with_roots.of_kind(guard.INTERPRETER)
+                            + with_roots.of_kind(guard.UNKNOWN))
+            writes = with_roots.of_kind(guard.WRITE)
+            if with_roots.uses:
+                print(f"hpc-run: the payload needs profile {needed!r} to run "
+                      "trusted scripts:", file=sys.stderr)
+                for use in with_roots.uses:
+                    print(f"  {use.path} {use.args}".rstrip(), file=sys.stderr)
+        if interpreters or writes:
+            _print_violations(
+                interpreters + writes,
+                f"hpc-run: the payload needs profile {needed!r}:",
+            )
+        print("\nhpc-run: " + profile_mod.refusal(target, needed, "this payload"),
+              file=sys.stderr)
+        if needed == "improvise" and any(".py" in v.line for v in interpreters):
+            print(_script_root_hint(target), file=sys.stderr)
+        if _writes_heredoc(script):
+            print(_heredoc_hint(), file=sys.stderr)
+        refused = interpreters + writes
+        return transport.EXIT_GUARD, [], needed, [], refused[0].line if refused else None
+
+    if interpreters and not allow_exec:
+        _print_violations(
+            interpreters,
+            "hpc-run: payload runs arbitrary code and --allow-exec was not "
+            "given:",
+        )
+        print(
+            "\nNothing was transmitted. These commands execute text the guard "
+            "cannot read, so none of its other checks apply to what they do — "
+            "a python -c can spell an rm this tool would otherwise refuse.\n"
+            "Prefer a narrower command when one exists. Otherwise, at profile "
+            "improvise, add --allow-exec and resend: it labels the command so "
+            "the user is asked to approve it, and their answer to that prompt "
+            "is the approval. Tell the user it needs their approval; don't "
+            "present the token as your own decision.",
+            file=sys.stderr,
+        )
+        if any(".py" in v.line for v in interpreters):
+            print(_script_root_hint(target), file=sys.stderr)
+        if _writes_heredoc(script):
+            print(_heredoc_hint(), file=sys.stderr)
+        return transport.EXIT_GUARD, [], needed, [], interpreters[0].line
+
+    if writes and not allow_write:
+        _print_violations(
+            writes,
+            "hpc-run: payload contains WRITE-tier operations and --allow-write "
+            "was not given:",
+        )
+        print(
+            "\nNothing was transmitted. If the write is what the user wants, "
+            "add --allow-write and resend: it labels the command so the user "
+            "is asked to approve it, and their answer to that prompt is the "
+            "approval.",
+            file=sys.stderr,
+        )
+        return transport.EXIT_GUARD, [], needed, [], writes[0].line
+
+    return None, report.uses, needed, report.repo_writes(), None
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(allow_abbrev=False, 
+        prog="hpc-run",
+        description=(
+            "Run a bash script on a remote HPC. Normal form: pipe the script "
+            "to 'hpc-run -'. Payloads are guarded; command strings and "
+            "temp-dir script files are refused by design."
+        ),
+        epilog=(
+            "Exit: 0 ok, 1-63 from the remote script, 64 usage or an undefined $HPC_* name, 69 no master, "
+            "77 guard refusal, 124 timeout, 255 ssh failure."
+        ),
+    )
+    parser.add_argument(
+        "script",
+        metavar="-|SCRIPT",
+        help="'-' to read the script from stdin (normal form), or a path to a "
+        "versioned script (temp directories are refused)",
+    )
+    parser.add_argument("--site", metavar="NAME", help="site name from ~/.config/hpc-tether/sites/*.toml")
+    parser.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="permit WRITE-tier operations (sbatch, confined mv, git writes, "
+        "...). Never a deletion: rm is refused regardless. A label that "
+        "makes the approval hook ask the user; their answer is the approval.",
+    )
+    parser.add_argument(
+        "--allow-exec",
+        action="store_true",
+        help="permit INTERPRETER-tier operations (python/perl, nested bash -c, "
+        "eval, srun, make, curl/wget/scp). A label that makes the approval "
+        "hook ask the user; their answer is the approval.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=transport.DEFAULT_TIMEOUT,
+        metavar="SEC",
+        help=f"local wall-clock limit (default: {transport.DEFAULT_TIMEOUT}); "
+        "the remote watchdog is sized just below it. Size it to the work: "
+        "above ~540, make the Bash call with run_in_background, since a "
+        "foreground Bash call is capped at 10 minutes",
+    )
+    parser.add_argument(
+        "--no-trust",
+        action="store_true",
+        help="classify as if the site trusted no repos. For "
+        "diagnosing why a payload is or is not treated as a pre-built "
+        "script; it never widens anything.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="run the guard and print the assembled payload without connecting",
+    )
+    args = parser.parse_args(argv)
+
+    if args.timeout <= 0:
+        print("hpc-run: --timeout must be positive", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    try:
+        target = site_mod.load(args.site)
+    except site_mod.SiteError as exc:
+        print(f"hpc-run: {exc}", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    script = _read_script(args.script)
+
+    # At `observe` only the fixed tools run. Their remote scripts are written
+    # by the toolkit and the agent's input reaches them as quoted arguments, so
+    # nothing the agent writes as shell is sent at this level.
+    if not target.allows("prepare"):
+        print("hpc-run: REFUSED by profile: profile 'observe' allows only the "
+              "fixed tools (hpc-check, hpc-jobs, hpc-read, hpc-ls, hpc-nc, "
+              "hpc-probe, hpc-pull, hpc-fetch, hpc-sync-status, and the local "
+              "hpc-audit and hpc-trust). Free-form shell starts at 'prepare'; "
+              f"site {target.name!r} is at {target.profile!r}. The profile is "
+              "the user's setting in the site file: never edit it to get past "
+              "this refusal. Nothing was transmitted. Use a fixed tool, or tell "
+              "the user what you wanted to run and which profile would allow it.",
+              file=sys.stderr)
+        if not args.dry_run:
+            audit.record("refused", target.name, target.host, audit.first_line(script),
+                         transport.EXIT_GUARD, payload=script,
+                         extra={"level": "prepare"}, body=script)
+        return transport.EXIT_GUARD
+
+    undefined = _undefined_roles(script, target)
+    if undefined:
+        names = ", ".join("$" + n for n in undefined)
+        roles = {"HPC_SITE": target.name, "HPC_HOST": target.host,
+                 "HPC_USER": target.user, "HPC_SCHEDULER": target.scheduler,
+                 **target.env()}
+        print(f"hpc-run: {names} {'is' if len(undefined) == 1 else 'are'} not defined "
+              f"for site {target.name!r}. Nothing was transmitted. The payload's "
+              "$HPC_* names are:", file=sys.stderr)
+        for name, value in sorted(roles.items()):
+            print(f"  ${name}  {value}", file=sys.stderr)
+        if "HPC_PYTHON_BIN" in undefined:
+            print("The site file sets no python_bin ([environment]), so there is "
+                  "no Python environment to put on PATH. Adding it is the user's "
+                  "edit; tell them.", file=sys.stderr)
+        print("Use one of these, or spell the path out. A repo is $HPC_<ROLE> "
+              "only if its [repos] entry sets role; otherwise use its full "
+              "path (bin/hpc-trust list).", file=sys.stderr)
+        if not args.dry_run:
+            line = next((s.strip() for s in script.splitlines()
+                         if any(n in s for n in undefined)), "")
+            audit.record("refused", target.name, target.host,
+                         line or audit.first_line(script), transport.EXIT_USAGE,
+                         payload=script, extra={"refusal": f"undefined {names}"},
+                         body=script)
+        return transport.EXIT_USAGE
+
+    # Script roots are in force only from `operate` up; below it a trusted
+    # script is code the profile does not run.
+    site_roots = None if args.no_trust else trust.Roots.for_site(target)
+    active = target.allows("operate")
+    guard_exit, uses, needed, repo_writes, refused_line = _apply_guard(
+        script, target, args.allow_write, args.allow_exec,
+        roots=site_roots if active else None,
+        inactive_roots=None if active else site_roots,
+    )
+    # Every payload's text goes in the audit log, refused ones too: the log
+    # of real use is how the toolkit is judged and tuned. A first line alone
+    # left half the payloads unreadable (mostly an `export PATH=...`).
+    # A refusal no profile would lift has no level: the receipt must not say
+    # "needs profile observe" for it.
+    level = {"level": needed} if needed else {"refusal": "forbidden at every profile"}
+    if needed and guard_exit is not None and target.allows(needed):
+        # The profile allows it, so a token was missing; the receipt said
+        # "needs profile operate" at operate.
+        # _apply_guard checks --allow-exec before --allow-write.
+        level["refusal"] = ("needs --allow-exec" if needed == "improvise"
+                            else "needs --allow-write")
+    if guard_exit is not None and not args.dry_run:
+        # A refusal is part of the record of what the agent tried. Only the
+        # transport's own deletion refusal was logged; one made here left no
+        # line at all.
+        detail = (refused_line or "").strip() or audit.first_line(script)
+        audit.record("refused", target.name, target.host, detail,
+                     guard_exit, payload=script, extra=level, body=script)
+        return guard_exit
+
+    # Code the guard can't read must be kept whole in the audit log. Past the
+    # log's limit only a prefix would be kept, and the rest would run
+    # unrecorded, so it is not sent. Other payloads past the limit are sent
+    # and logged cut, with the cut marked.
+    if needed == "improvise" and len(script) > audit.BODY_LIMIT and not args.dry_run:
+        print(f"hpc-run: REFUSED — this payload is {len(script)} characters, and "
+              f"the audit log keeps at most {audit.BODY_LIMIT} of code the guard "
+              "can't read. Nothing was transmitted. Shorten it, or put the code "
+              "in a trusted script.", file=sys.stderr)
+        audit.record("refused", target.name, target.host, audit.first_line(script),
+                     transport.EXIT_GUARD, payload=script,
+                     extra={"refusal": "code too long for the audit log"}, body=script)
+        return transport.EXIT_GUARD
+
+    # The queue check before a resubmit, made part of the submission: a job
+    # named literally on an sbatch line is checked against the queue on the
+    # cluster before the payload's first line (exit 79 if one is active).
+    job_names, unchecked = guard.sbatch_job_names(script)
+    repeats = guard.sbatch_repeats(script)
+    if repeats and not args.dry_run:
+        print("hpc-run: REFUSED — this payload submits the job name "
+              f"{', '.join(repeats)} more than once (twice, or inside a loop). "
+              "The queue is checked once before the payload runs, so the second "
+              "submission would not be seen. Nothing was transmitted. Submit "
+              "one job of a name per payload.", file=sys.stderr)
+        # Its reason, not a level: the receipt said "needs profile operate"
+        # at operate.
+        audit.record("refused", target.name, target.host, audit.first_line(script),
+                     transport.EXIT_DUPLICATE, payload=script,
+                     extra={"refusal": "job name submitted more than once"}, body=script)
+        return transport.EXIT_DUPLICATE
+    for line in unchecked:
+        print("hpc-run: note: this sbatch's job name isn't a literal -J/--job-name, "
+              "so the queue can't be checked for it; run bin/hpc-jobs --name NAME "
+              f"first: {line}", file=sys.stderr)
+
+    # A git write in a [repos] checkout runs only if the cluster checkout's
+    # origin is the local repository's (exit 80 on the cluster otherwise).
+    origin_checks = []
+    for name in repo_writes:
+        repo = target.repos[name]
+        try:
+            url = gitsync.local_origin(repo.local)
+        except gitsync.OriginError as exc:
+            print(f"hpc-run: [repos] {name}: {exc}. Nothing was transmitted: the "
+                  "entry's local side must be the repository the cluster checkout "
+                  "mirrors. Fixing the site file is the user's to do.", file=sys.stderr)
+            return transport.EXIT_ORIGIN
+        origin_checks.append((name, repo.remote, gitsync.normalize_url(url)))
+
+    if args.dry_run:
+        if guard_exit is not None:
+            print("--- guard would refuse this payload (see above) ---\n",
+                  file=sys.stderr)
+        sys.stdout.write(
+            transport.build_payload(
+                target, script, local_timeout=args.timeout, trust_uses=uses,
+                job_names=job_names, origin_checks=origin_checks,
+            )
+        )
+        return guard_exit if guard_exit is not None else transport.EXIT_OK
+
+    try:
+        result = transport.run_remote(
+            target, script, timeout=args.timeout, trust_uses=uses,
+            record_body=True,
+            job_names=job_names,
+            origin_checks=origin_checks,
+            audit_extra=level,
+        )
+    except transport.TransportError as exc:
+        print(f"hpc-run: {exc}", file=sys.stderr)
+        return exc.code
+
+    if result.returncode == transport.EXIT_SSH_FAILURE:
+        # A master that died mid-payload left a bare 255.
+        print(f"hpc-run: exit 255 from ssh: the connection to {target.host} failed, "
+              "most often because the master died mid-payload (or the payload "
+              "itself exited 255). The payload may have run fully, partly or not "
+              "at all. Run hpc-check, and look at the remote state before any "
+              "retry.", file=sys.stderr)
+    elif (result.returncode == 127 and re.search(r"\bpython3?\b", script)
+          and "HPC_PYTHON_BIN" not in script and target.paths.get("python_bin")):
+        # The payload shell has no python on its PATH.
+        print("hpc-run: exit 127, command not found. The payload shell does not "
+              "read the login profile, so the site's Python is not on its PATH. "
+              'Start the payload with export PATH="$HPC_PYTHON_BIN:$PATH" (a '
+              "trusted script stays trusted with that line).", file=sys.stderr)
+    return result.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

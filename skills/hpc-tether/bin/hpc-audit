@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Read the audit log: what this toolkit sent to a cluster, when, under what.
+
+Every payload, scp and rsync the toolkit issues is one JSON line in
+``~/.local/state/hpc-tether/audit-YYYY-MM.jsonl`` -- one file per UTC month
+(see hpctether/audit.py). This verb prints it readably. It is the answer to
+"what did the agent do on the cluster today" -- on the cluster side everything
+arrives as the account holder, so this is the only record that distinguishes
+agent from human.
+
+By default it reads the current month only. ``--since YYYY-MM`` reads every
+month from that one forward, and ``--all`` reads every month present, oldest
+entries first. Nothing here writes, truncates or removes a log file.
+
+``--full`` prints each shown payload's whole text under its line. Every
+``hpc-run`` payload is kept whole (up to the log's cut, which is marked);
+the fixed tools record their arguments, which is what this prints for them.
+``--code`` shows only payloads that needed profile improvise (hand-written
+code), in full.
+
+``--transfers`` prints instead one short summary per session of the data that
+moved: totals in and out, the time span, the session budget, and one line per
+remote directory -- never one per file. It is what the agent reports in chat
+after a transfer step (``--transfers --session current``).
+
+Local only: it never opens a connection.
+
+Exit codes:
+    0    printed (an empty log is a valid, empty answer)
+    64   usage error
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the installed skill
+from pathlib import Path
+
+MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hpctether import audit, budget
+
+
+def _rows(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    out = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            out.append({"ts": "?", "kind": "unparseable", "detail": line[:120], "rc": None})
+    return out
+
+
+def select_paths(since: str | None, everything: bool) -> list[Path]:
+    """The log files to read, oldest month first.
+
+    Default: the current month alone. ``--since`` takes every month from that
+    one forward; ``--all`` takes every month present. When HPC_TETHER_AUDIT
+    names one exact .jsonl file there are no months, and that file is it.
+    """
+    months = audit.existing_months()
+    if not months:
+        return [audit.audit_path()]
+    if everything:
+        chosen = months
+    elif since:
+        chosen = [m for m in months if m >= since]
+    else:
+        current = audit.audit_path().name[len("audit-"):-len(".jsonl")]
+        chosen = [m for m in months if m == current]
+    return [audit.audit_path(m) for m in chosen]
+
+
+def _short_remote(path: str) -> str:
+    parts = path.rstrip("/").split("/")
+    return path if len(parts) <= 4 else "…/" + "/".join(parts[-3:])
+
+
+def _short_local(path: str) -> str:
+    here, home = Path.cwd(), Path.home()
+    p = Path(path)
+    for base, prefix in ((here, ""), (home, "~/")):
+        try:
+            rel = p.relative_to(base)
+            return prefix + (str(rel) if str(rel) != "." else "") or "."
+        except ValueError:
+            continue
+    return path
+
+
+def summarize_transfers(rows: list[dict]) -> list[str]:
+    """One block per session: totals, span, budget, one line per directory."""
+    sessions: dict[str, list[dict]] = {}
+    for r in rows:
+        sessions.setdefault(r.get("session") or "", []).append(r)
+    out: list[str] = []
+    for sess, srows in sessions.items():
+        moved = [r for r in srows if r.get("direction") in ("in", "out")]
+        refused = [r for r in srows if r.get("kind") == "refused"
+                   and str(r.get("detail", "")).startswith("session budget")]
+        if not moved and not refused:
+            continue
+        t = budget.totals(srows)
+        stamps = sorted(r.get("ts", "") for r in moved)
+        span = f"{stamps[0][11:16]}–{stamps[-1][11:16]} UTC" if stamps else "-"
+        label = sess[:8] if sess else "(no session: by hand)"
+        head = (f"session {label}: {t['in_files']} files {budget.human(t['in_bytes'])} in, "
+                f"{t['out_files']} files {budget.human(t['out_bytes'])} out, {span}")
+        if sess:
+            head += f"; budget {budget.human(t['budget'])}"
+        if refused:
+            head += f"; {len(refused)} refused over budget"
+        out.append(head)
+        groups: dict[tuple, list[int]] = {}
+        for r in moved:
+            remote, local = r.get("remote", "?"), r.get("local", "?")
+            if r.get("kind") != "rsync":
+                remote = remote.rsplit("/", 1)[0] or "/"
+                local = str(Path(local).parent)
+            key = (r["direction"], r.get("site", ""), remote, local)
+            g = groups.setdefault(key, [0, 0])
+            g[0] += int(r.get("files") or 0)
+            g[1] += int(r.get("bytes") or 0)
+        for (d, site, remote, local), (files, nbytes) in groups.items():
+            arrow = "←" if d == "in" else "→"
+            noun = "file " if files == 1 else "files"
+            out.append(f"  {arrow} {site}:{_short_remote(remote)}  {files:>4} {noun} "
+                       f"{budget.human(nbytes):>9}  {'→' if d == 'in' else '←'} "
+                       f"{_short_local(local)}")
+    return out or ["no transfers recorded"]
+
+
+def is_code(row: dict) -> bool:
+    """A payload that needed profile improvise. Lines from older
+    versions have no ``level`` and kept a body only for such payloads."""
+    if "level" in row:
+        return row["level"] == "improvise"
+    return "body" in row
+
+
+def summary(row: dict) -> str:
+    """What a line shows: a fixed tool's arguments, else the payload's first
+    line. A fixed tool's script is the toolkit's, so its first line says
+    nothing about the request."""
+    verb = row.get("verb", "")
+    if (row.get("kind") in ("payload", "refused") and verb.startswith("hpc-")
+            and verb != "hpc-run" and "body" not in row and row.get("argv")):
+        return row["argv"]
+    detail = row.get("detail", "")
+    # Entries written before audit.first_line skipped the python PATH line
+    # carry it as `detail`; show the first line that says what ran.
+    if audit.is_path_prelude(detail) and row.get("body"):
+        for line in row["body"].splitlines():
+            s = line.strip()
+            if s and not s.startswith("#") and not audit.is_path_prelude(s):
+                return s
+    return detail
+
+
+def why(row: dict) -> str | None:
+    """Why a refused entry was refused, as the log records it. Entries
+    written before refusals carried a reason have only the profile level
+    the payload needed; say so rather than guess."""
+    if row.get("kind") != "refused":
+        return None
+    if row.get("refusal"):
+        return row["refusal"]
+    if row.get("level"):
+        return f"not recorded (the payload needed profile {row['level']})"
+    return "not recorded"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(allow_abbrev=False, 
+        prog="hpc-audit",
+        description="Print the toolkit's audit log: every payload and transfer sent.",
+        epilog="Exit: 0 printed, 64 usage.",
+    )
+    parser.add_argument("--last", type=int, default=50, metavar="N",
+                        help="show the last N entries (default 50)")
+    parser.add_argument("--session", metavar="ID",
+                        help="only entries from this Claude Code session id "
+                        "('current' for the running session)")
+    parser.add_argument("--writes", action="store_true",
+                        help="only entries run with a confirmation token, or refused")
+    parser.add_argument("--since", metavar="YYYY-MM",
+                        help="also read earlier monthly logs, from this month on "
+                        "(default: the current month only)")
+    parser.add_argument("--all", action="store_true", dest="everything",
+                        help="read every monthly log present")
+    parser.add_argument("--transfers", action="store_true",
+                        help="summarize data moved per session: totals, budget, "
+                        "one line per remote directory (--last is ignored)")
+    parser.add_argument("--code", action="store_true",
+                        help="only payloads that needed profile improvise "
+                        "(hand-written code), each printed in full")
+    parser.add_argument("--full", action="store_true",
+                        help="print the whole text of each shown hpc-run "
+                        "payload under its line (fixed tools show their "
+                        "arguments)")
+    parser.add_argument("--json", action="store_true", help="emit the raw JSON lines")
+    args = parser.parse_args(argv)
+
+    if args.last <= 0:
+        print("hpc-audit: --last must be positive", file=sys.stderr)
+        return 64
+    if args.since and not MONTH_RE.match(args.since):
+        print(f"hpc-audit: --since wants YYYY-MM, got {args.since!r}", file=sys.stderr)
+        return 64
+
+    paths = select_paths(args.since, args.everything)
+    rows = [r for p in paths for r in _rows(p)]
+    if args.session:
+        want = audit._context()["session"] if args.session == "current" else args.session
+        rows = [r for r in rows if r.get("session") == want]
+    if args.writes:
+        rows = [r for r in rows if r.get("tokens") or r.get("kind") == "refused"]
+    if args.code:
+        rows = [r for r in rows if is_code(r)]
+    if args.transfers:
+        print("\n".join(summarize_transfers(rows)))
+        return 0
+    rows = rows[-args.last:]
+
+    if args.json:
+        for r in rows:
+            print(json.dumps(r, sort_keys=True))
+        return 0
+
+    where = paths[0] if len(paths) == 1 else f"{audit.audit_dir()}  ({len(paths)} months)"
+    print(f"{where}  ({len(rows)} shown)")
+    for r in rows:
+        who = "agent" if r.get("agent") else "human"
+        sess = (r.get("session") or "")[:8]
+        tokens = ",".join(r.get("tokens") or []) or "-"
+        secs = f"{r['seconds']:.1f}s" if r.get("seconds") is not None else "-"
+        print(
+            f"{r.get('ts', '?')}  {who:5s} {sess:8s} {r.get('kind', '?'):8s} "
+            f"rc={r.get('rc')!s:>3}  {secs:>7}  {r.get('verb', ''):15s} "
+            f"{tokens:12s} {summary(r)}"
+        )
+        reason = why(r)
+        if reason:
+            print(f"    why: {reason}")
+        if (args.code or args.full) and "body" in r:
+            for line in r["body"].splitlines():
+                print(f"    | {line}")
+            if r.get("body_truncated"):
+                total = r.get("body_length")
+                of = f" of {total}" if total else ""
+                print(f"    | ... (cut at {len(r['body'])}{of} characters)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

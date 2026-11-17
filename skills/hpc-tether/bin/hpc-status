@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""What hpc-tether is set to, and what this session has sent: for the user.
+
+Local only: reads the site files, the ControlMaster socket (``ssh -O check``)
+and the audit log. Sends nothing to a cluster.
+
+The user can run it without the agent, from the Claude Code prompt:
+
+    ! <plugin>/skills/hpc-tether/bin/hpc-status
+
+or as ``/hpc-tether:status``. Either way the lines come from the toolkit's
+own files, not from the agent's account of what it did.
+
+Prints:
+  * the plugin version and the receipts setting (hooks/receipts.py);
+  * per site: profile, and whether the connection is up;
+  * for this Claude Code session (or ``--session ID``; outside Claude Code,
+    the most recent session in the log): how many cluster calls, split into
+    reads, writes, job control, agent-written code, trusted scripts, refusals
+    and failures; data moved; and the last few calls as receipt lines.
+
+Exit: 0 printed, 64 usage.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the installed skill
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hpctether import audit, profile as profile_mod, site as site_mod, transport
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _receipts():
+    """hooks/receipts.py, for one rendering of an entry across hook and tool.
+
+    None when the toolkit runs outside the plugin (no hooks/ beside it).
+    """
+    path = PLUGIN_ROOT / "hooks" / "receipts.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("hpc_receipts", path)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        return None
+    return module
+
+
+def _version() -> str:
+    try:
+        return json.loads((PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text())["version"]
+    except (OSError, ValueError, KeyError):
+        return "?"
+
+
+def _entries() -> list[dict]:
+    """This month's and last month's entries: a session can span the turn."""
+    months = audit.existing_months()
+    paths = [audit.audit_path(m) for m in months[-2:]] if months else [audit.audit_path()]
+    out = []
+    for path in paths:
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                continue
+    return out
+
+
+def _category(entry: dict) -> str:
+    kind = entry.get("kind")
+    if kind == "refused":
+        return "refused"
+    if kind == "budget":
+        return "budget"
+    if entry.get("rc") not in (0, None):
+        return "failed"
+    if kind in ("scp", "rsync"):
+        return "pushed" if entry.get("direction") == "out" else "pulled"
+    if entry.get("trusted"):
+        return "trusted script"
+    level = entry.get("level")
+    if entry.get("verb") == "hpc-push" or level == "prepare":
+        return "write"
+    if level == "operate":
+        return "job control"
+    if level == "improvise":
+        return "agent code"
+    return "read"
+
+
+ORDER = ("read", "pulled", "write", "pushed", "job control", "trusted script",
+         "agent code", "budget", "refused", "failed")
+
+
+def site_lines() -> list[str]:
+    names = site_mod.available()
+    if not names:
+        return [f"no site file in {site_mod.sites_dir()}: nothing to connect to "
+                "(reference/setup.md)"]
+    out = []
+    for name in names:
+        try:
+            target = site_mod.load(name)
+        except site_mod.SiteError as exc:
+            out.append(f"{name}: site file error: {exc}")
+            continue
+        try:
+            live, _ = transport.check_master(target)
+            conn = "connected" if live else f"NOT connected (you run: {transport.reopen_hint(target)})"
+        except transport.TransportError as exc:
+            conn = f"connection unknown: {exc}"
+        out.append(f"{name}: profile {target.profile} ({profile_mod.SUMMARY[target.profile]}) · {conn}")
+    return out
+
+
+def session_lines(entries: list[dict], session: str, last: int, rec) -> list[str]:
+    mine = [e for e in entries if e.get("session") == session]
+    if not mine:
+        return [f"session {session[:8]}: no cluster calls yet"]
+    counts: dict[str, int] = {}
+    for e in mine:
+        c = _category(e)
+        counts[c] = counts.get(c, 0) + 1
+    calls = sum(n for c, n in counts.items() if c != "budget")
+    since = mine[0].get("ts", "?")[11:16]
+    tally = " · ".join(f"{c}: {counts[c]}" for c in ORDER if counts.get(c))
+    lines = [f"session {session[:8]}: {calls} cluster calls since {since} UTC", f"  {tally}"]
+    moved_in = [e for e in mine if e.get("direction") == "in" and e.get("rc") == 0]
+    moved_out = [e for e in mine if e.get("direction") == "out" and e.get("rc") == 0]
+    if moved_in or moved_out:
+        def total(rows):
+            files = sum(int(e.get("files", 0)) for e in rows)
+            size = sum(int(e.get("bytes", 0)) for e in rows)
+            return f"{files} file{'s' if files != 1 else ''}, {rec.human(size) if rec else f'{size} B'}"
+        lines.append(f"  data: in {total(moved_in)} · out {total(moved_out)}")
+    if last > 0:
+        lines.append(f"last {min(last, len(mine))}:")
+        for e in mine[-last:]:
+            if rec:
+                lines.append("  " + rec.receipt(e)[len(rec.PREFIX):])
+            else:
+                lines.append(f"  {e.get('verb', '?')} {e.get('kind', '?')} rc={e.get('rc')}")
+    return lines
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        allow_abbrev=False, prog="hpc-status",
+        description="Show hpc-tether's settings and what this session sent. Local only.",
+        epilog="Exit: 0 printed, 64 usage.")
+    parser.add_argument("--session", metavar="ID",
+                        help="a Claude Code session id (default: the running session, "
+                             "else the most recent one in the log)")
+    parser.add_argument("--last", type=int, default=5, metavar="N",
+                        help="show the session's last N calls (default 5; 0 for none)")
+    args = parser.parse_args(argv)
+
+    rec = _receipts()
+    setting = rec.setting() if rec else "n/a (hooks not found)"
+    where = (Path(rec.config_dir()) / "config.toml") if rec else ""
+    print(f"hpc-tether {_version()} · receipts: {setting}" + (f" (set in {where})" if where else ""))
+    for line in site_lines():
+        print(line)
+
+    entries = _entries()
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    note = ""
+    if args.session:
+        # The 8-character prefix the receipts and hpc-audit show is enough.
+        ids = sorted({e["session"] for e in entries
+                      if str(e.get("session", "")).startswith(args.session)})
+        if len(ids) > 1:
+            print(f"hpc-status: --session {args.session} matches {len(ids)} sessions; "
+                  "give more of the id", file=sys.stderr)
+            return transport.EXIT_USAGE
+        session = ids[0] if ids else args.session
+    if not session:
+        with_session = [e for e in entries if e.get("session")]
+        if not with_session:
+            print("no Claude Code session in the audit log yet")
+            return transport.EXIT_OK
+        session = with_session[-1]["session"]
+        note = " (most recent in the log; not run under Claude Code)"
+    lines = session_lines(entries, session, args.last, rec)
+    lines[0] += note
+    for line in lines:
+        print(line)
+    return transport.EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""List one remote directory, or describe one file: bounded, read-only.
+
+For each entry: type, size, modification time, name, and a link's target.
+No recursion: the walk is one directory deep, so its cost on a shared
+filesystem is that directory's size. Entries are sorted on the cluster (by
+name, time or size) and at most ``--limit`` are shown, with a line saying how
+many more there are. Names starting with ``.`` are left out unless ``--all``.
+
+PATH may be absolute or ``role:relative/path`` (a key of the site's
+``[paths]``). A directory, or a link to one, is listed; anything else is
+described as a single entry, a link with its target.
+
+Needs GNU find and sort on the cluster (``-printf``, ``sort -z``), as every
+Linux cluster this toolkit targets has.
+
+Exit codes:
+    0    listed
+    64   usage error or unknown site/role
+    66   no such file or directory, or the directory is not readable
+    69   no ControlMaster socket
+    70   the remote listing failed or could not be parsed
+    124  timeout
+    255  ssh transport failure
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shlex
+import sys
+from datetime import datetime, timezone
+
+sys.dont_write_bytecode = True  # no __pycache__ in the installed skill
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hpctether import site as site_mod
+from hpctether import transport
+
+EXIT_NOINPUT = 66
+EXIT_REMOTE = 70
+
+DEFAULT_LIMIT = 200
+LIMIT_CEILING = 5000
+
+#: find -printf type letters.
+TYPES = {"f": "file", "d": "dir", "l": "link", "p": "fifo", "s": "socket",
+         "c": "char", "b": "block", "D": "door"}
+
+#: sort keys per --sort: name ascending, newest first, largest first; ties
+#: by name. Records are "type/size/mtime/name/target", NUL-terminated: a name
+#: holds no "/", and the target, which may, comes last.
+SORT_KEYS = {
+    "name": "-t/ -k4,4",
+    "time": "-t/ -k3,3gr -k4,4",
+    "size": "-t/ -k2,2nr -k4,4",
+}
+
+# Arguments: path, sort keys, limit, all (1 or 0). The path starts with "/"
+# (Site.remote_path), which is what keeps find from reading it as an
+# expression: find takes no `--` before its starting points.
+_SCRIPT = r"""
+p="$1"; keys="$2"; limit="$3"; all="$4"
+if [ ! -e "$p" ] && [ ! -L "$p" ]; then
+  echo "hpc-ls: no such file or directory: $p" >&2
+  exit 66
+fi
+fmt='%y/%s/%T@/%f/%l\0'
+if [ -d "$p" ]; then
+  if [ ! -r "$p" ] || [ ! -x "$p" ]; then
+    echo "hpc-ls: directory not readable: $p" >&2
+    exit 66
+  fi
+  echo "###DIR###"
+  if [ "$all" = 1 ]; then
+    list() { find -H "$p" -mindepth 1 -maxdepth 1 -printf "$fmt"; }
+  else
+    list() { find -H "$p" -mindepth 1 -maxdepth 1 ! -name '.*' -printf "$fmt"; }
+  fi
+else
+  echo "###ENTRY###"
+  list() { find "$p" -maxdepth 0 -printf "$fmt"; }
+fi
+n=0
+while IFS= read -r -d '' rec; do
+  n=$((n + 1))
+  if [ "$n" -le "$limit" ]; then printf '%s\0' "$rec"; fi
+done < <(list | LC_ALL=C sort -z $keys)
+echo "###TOTAL### $n"
+"""
+
+
+class ParseError(RuntimeError):
+    """The listing's output was not in the expected shape."""
+
+
+def build_script(path: str, sort: str, limit: int, show_all: bool) -> str:
+    args = [path, SORT_KEYS[sort], str(limit), "1" if show_all else "0"]
+    return f"set -- {' '.join(shlex.quote(a) for a in args)}\n{_SCRIPT}"
+
+
+def parse(stdout: str) -> tuple[str, list[dict], int]:
+    """``(kind, entries, total)`` from the listing script's output."""
+    head, sep, rest = stdout.partition("\n")
+    kind = head.strip().strip("#").lower()
+    if not sep or kind not in ("dir", "entry"):
+        raise ParseError(f"unexpected first line {head[:80]!r}")
+    *records, tail = rest.split("\0")
+    tail = tail.strip()
+    if not tail.startswith("###TOTAL### "):
+        raise ParseError(f"no total line (got {tail[:80]!r})")
+    try:
+        total = int(tail.split()[1])
+    except (IndexError, ValueError):
+        raise ParseError(f"bad total line {tail!r}") from None
+    entries = []
+    for rec in records:
+        parts = rec.split("/", 4)
+        if len(parts) != 5:
+            raise ParseError(f"bad record {rec[:80]!r}")
+        kind_letter, size, mtime, name, target = parts
+        try:
+            entries.append({
+                "name": name,
+                "type": TYPES.get(kind_letter, kind_letter),
+                "size": int(size),
+                "mtime": float(mtime),
+                "target": target or None,
+            })
+        except ValueError:
+            raise ParseError(f"bad record {rec[:80]!r}") from None
+    return kind, entries, total
+
+
+def _human(n: int) -> str:
+    value = float(n)
+    for unit in ("B", "K", "M", "G", "T"):
+        if value < 1024 or unit == "T":
+            return f"{int(value)}{unit}" if unit == "B" else f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{n}B"
+
+
+def _when(mtime: float) -> str:
+    return datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_rows(entries: list[dict], exact: bool) -> list[str]:
+    rows = []
+    for e in entries:
+        size = str(e["size"]) if exact else _human(e["size"])
+        name = e["name"] + ("/" if e["type"] == "dir" else "")
+        if e["target"]:
+            name += f" -> {e['target']}"
+        rows.append((e["type"], size, _when(e["mtime"]), name))
+    if not rows:
+        return []
+    w0 = max(len(r[0]) for r in rows)
+    w1 = max(len(r[1]) for r in rows)
+    return [f"{t:<{w0}}  {s:>{w1}}  {m}  {n}" for t, s, m, n in rows]
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(allow_abbrev=False,
+        prog="hpc-ls",
+        description="List one remote directory, or describe one file: type, "
+        "size, modification time (UTC), name, link target. Read-only, one "
+        "level deep, bounded.",
+        epilog=(
+            "Examples: hpc-ls rundir:case42; hpc-ls rundir:case42 --sort time "
+            "--limit 20; hpc-ls rundir:case42/atm.log. "
+            "Exit: 0 ok, 64 usage, 66 not found or unreadable, 69 no master, "
+            "70 listing failed, 124 timeout, 255 ssh failure."
+        ),
+    )
+    parser.add_argument(
+        "path",
+        metavar="PATH",
+        help="absolute remote path, or role:relative/path from the site's [paths]",
+    )
+    parser.add_argument("--sort", choices=sorted(SORT_KEYS), default="name",
+                        help="name (default), time (newest first) or size "
+                        "(largest first)")
+    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, metavar="N",
+                        help=f"show at most N entries (default {DEFAULT_LIMIT}, "
+                        f"at most {LIMIT_CEILING}); the rest are counted")
+    parser.add_argument("--all", action="store_true", dest="show_all",
+                        help="include names starting with '.'")
+    parser.add_argument("--bytes", action="store_true",
+                        help="sizes in bytes (default: K/M/G, 1024-based)")
+    parser.add_argument("--json", action="store_true",
+                        help="emit {path, kind, total, shown, entries} as JSON "
+                        "(sizes in bytes, mtime in epoch seconds)")
+    parser.add_argument("--site", metavar="NAME",
+                        help="site name from ~/.config/hpc-tether/sites/*.toml")
+    parser.add_argument("--timeout", type=int, default=60, metavar="SEC",
+                        help="local timeout (default 60)")
+    args = parser.parse_args(argv)
+
+    if args.timeout <= 0:
+        print("hpc-ls: --timeout must be positive", file=sys.stderr)
+        return transport.EXIT_USAGE
+    if not 0 < args.limit <= LIMIT_CEILING:
+        print(f"hpc-ls: --limit must be 1 to {LIMIT_CEILING}", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    try:
+        target = site_mod.load(args.site)
+        remote = target.remote_path(args.path)
+    except site_mod.SiteError as exc:
+        print(f"hpc-ls: {exc}", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    script = build_script(remote, args.sort, args.limit, args.show_all)
+    try:
+        result = transport.run_capture(target, script, timeout=args.timeout)
+    except transport.TransportError as exc:
+        print(f"hpc-ls: {exc}", file=sys.stderr)
+        return exc.code
+
+    if result.stderr.strip():
+        print(result.stderr.rstrip(), file=sys.stderr)
+    if result.returncode != 0:
+        return result.returncode
+    try:
+        kind, entries, total = parse(result.stdout)
+    except ParseError as exc:
+        print(f"hpc-ls: could not read the listing: {exc}", file=sys.stderr)
+        return EXIT_REMOTE
+
+    if args.json:
+        print(json.dumps({"path": remote, "kind": kind, "total": total,
+                          "shown": len(entries), "entries": entries}, indent=2))
+        return transport.EXIT_OK
+
+    if kind == "dir":
+        hidden = "" if args.show_all else ", dot names left out"
+        print(f"{remote}: {total} entries{hidden}, by {args.sort}; times UTC")
+        if not entries:
+            print("(empty)")
+    for row in format_rows(entries, args.bytes):
+        print(row)
+    if total > len(entries):
+        print(f"... {total - len(entries)} more not shown (raise --limit, at most "
+              f"{LIMIT_CEILING}, or use --sort)")
+    return transport.EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

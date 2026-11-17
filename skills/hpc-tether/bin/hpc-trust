@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Show which pre-built scripts run without a token, and why one does not.
+
+Script roots are the site file's trusted repos (`[repos.<name>]` with
+`trusted = true`, and their `confirm` patterns; see
+`~/.config/hpc-tether/sites/<site>.toml`). Any `.py` under a root, run as `python FILE.py ARGS` or
+directly, is read tier whatever its arguments; a `confirm` match is
+write tier; inline code and a `.py` anywhere else stay interpreter tier.
+Trusting a repo is the USER's call; the agent never edits the site file.
+
+Subcommands:
+    list                    print the roots and confirm patterns; never connects
+    check -                 classify a payload on stdin and say, per script
+                            invocation, which tier it got; never connects
+    describe -              one plain line saying what a payload on stdin
+                            will do (for the approval prompt); never connects
+    verify                  confirm each root exists on the remote (one
+                            read-only `test -d` per root)
+
+Exit codes:
+    0    ok (verify: every root exists)
+    1    verify: a root is missing
+    64   usage error or unknown site
+    69   no ControlMaster socket
+    124  timeout
+    255  ssh transport failure
+"""
+
+from __future__ import annotations
+
+import argparse
+import shlex
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the installed skill
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hpctether import describe as describe_mod, guard, transport, trust
+from hpctether import profile as profile_mod
+from hpctether import site as site_mod
+
+
+def cmd_list(args, target) -> int:
+    state = ("active" if target.allows("operate")
+             else "INACTIVE: profile is below operate")
+    print(f"profile: {target.profile} ({profile_mod.SUMMARY[target.profile]})")
+    print(f"trusted repos (script roots) for {target.name!r} ({target.source}), {state}:")
+    for root in target.script_roots or ["(none declared)"]:
+        scoped = target.root_confirm.get(root, ())
+        print(f"  {root}" + (f"   confirm: {', '.join(scoped)}" if scoped else ""))
+    if target.script_confirm:
+        print("confirm patterns for every root (still need --allow-write):")
+        for pattern in target.script_confirm:
+            print(f"  {pattern}")
+    if target.protected:
+        print("protected (never written):")
+        for root in target.protected:
+            print(f"  {root}")
+    mirrors = {n: r for n, r in sorted(target.repos.items()) if r.local}
+    if mirrors:
+        # An agent should read code locally before running it on the
+        # cluster; this is where it finds the local side (SKILL.md, Files).
+        print("local checkouts (read code here; hpc-sync-status NAME first):")
+        for name, repo in mirrors.items():
+            print(f"  {name}: {repo.local}  <->  {repo.remote}")
+    print("\nA root's scripts run with no token and unread by the guard. They must "
+          "never run code\nfrom a path or value an agent can write: see "
+          "reference/trusted-scripts.md.")
+    return 0
+
+
+def _classify(script, target):
+    return guard.classify(
+        script,
+        roots=target.guard_roots(),
+        scratch=target.paths.get("scratch"),
+        trust=trust.Roots.for_site(target),
+        paths=target.paths,
+        aliases=target.aliases,
+        script_roots=target.script_roots,
+        repos=target.repos,
+        protected=target.protected,
+    )
+
+
+def cmd_describe(args, target) -> int:
+    script = sys.stdin.read()
+    repeats = guard.sbatch_repeats(script)
+    if repeats:
+        # hpc-run refuses this locally, so the approval hook should not ask
+        #.
+        print(f"REFUSED, never sent: submits job name {', '.join(repeats)} more than once")
+        return 0
+    print(describe_mod.describe(script, _classify(script, target), target.paths,
+                                    target.aliases))
+    return 0
+
+
+def cmd_check(args, target) -> int:
+    script = sys.stdin.read()
+    report = _classify(script, target)
+    for note in report.notes:
+        print(f"note: {note}")
+    for use in report.uses:
+        print(f"{use.tier:<11} {use.path} {use.args}".rstrip())
+    for v in report.violations:
+        print(f"{v.kind:<11} line {v.lineno}: {v.line}")
+    print(f"\nworst tier: {report.worst() or 'read (no token)'}")
+    if report.worst() in (guard.FORBIDDEN, guard.TRAVERSAL):
+        needed = "none (never sent)"
+    else:
+        # The guard rates a plain read `observe`, but a payload goes through
+        # hpc-run, which observe refuses.
+        needed = profile_mod.needed_for(report)
+        if not profile_mod.allows(needed, "prepare"):
+            needed = "prepare (hpc-run's minimum; at observe use a fixed tool)"
+    print(f"needs profile: {needed}; site is at {target.profile}")
+    return 0
+
+
+def cmd_verify(args, target) -> int:
+    if not target.script_roots:
+        print(f"no script roots declared for {target.name!r}; nothing to verify")
+        return 0
+    probe = "".join(
+        f'if [ -d {shlex.quote(r)} ]; then echo "ok       {r}"; '
+        f'else echo "MISSING  {r}"; fi\n'
+        for r in target.script_roots
+    )
+    try:
+        result = transport.run_capture(target, probe, timeout=args.timeout)
+    except transport.TransportError as exc:
+        print(f"hpc-trust: {exc}", file=sys.stderr)
+        return exc.code
+    sys.stdout.write(result.stdout)
+    return 1 if "MISSING" in result.stdout else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(allow_abbrev=False, 
+        prog="hpc-trust",
+        description="Show the site's pre-built script roots and how a payload "
+        "is classified against them.",
+        epilog="Exit: 0 ok, 1 missing root, 64 usage, 69 no master, "
+        "124 timeout, 255 ssh failure.",
+    )
+    parser.add_argument("--site", metavar="NAME", help="site name from ~/.config/hpc-tether/sites/*.toml")
+    parser.add_argument("--timeout", type=int, default=60, metavar="SEC",
+                        help="remote call time limit for verify (default 60)")
+    subs = parser.add_subparsers(dest="command", required=True)
+    subs.add_parser("list", help="print script roots and confirm patterns")
+    check = subs.add_parser("check", help="classify a payload read from stdin")
+    check.add_argument("script", metavar="-", help="'-' (payload on stdin)")
+    desc = subs.add_parser("describe", help="say in plain words what a payload on stdin will do")
+    desc.add_argument("script", metavar="-", help="'-' (payload on stdin)")
+    subs.add_parser("verify", help="confirm each root exists on the remote")
+    args = parser.parse_args(argv)
+
+    if args.command in ("check", "describe") and args.script != "-":
+        parser.error(f"{args.command} reads the payload from stdin; pass '-'")
+    try:
+        target = site_mod.load(args.site)
+    except site_mod.SiteError as exc:
+        print(f"hpc-trust: {exc}", file=sys.stderr)
+        return transport.EXIT_USAGE
+    handlers = {"list": cmd_list, "check": cmd_check, "describe": cmd_describe,
+                "verify": cmd_verify}
+    return handlers[args.command](args, target)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

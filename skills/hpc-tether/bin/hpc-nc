@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""Read a netCDF file on the cluster: header, statistics, a slice, a diff.
+
+A quick look, not an analysis. It knows no model: variable, dimension and
+weight names come from you. It reads only, writes nothing anywhere, and runs
+at profile ``observe`` with no token. What runs on the cluster is a fixed,
+versioned program (hpctether/nc_remote.py) using the site's Python with
+``numpy`` and ``netCDF4``; nothing an agent writes is executed.
+
+    hpc-nc header FILE [--var V ...]
+    hpc-nc stats  FILE VAR [-d dim,start[,stop] ...] [--weights WVAR]
+    hpc-nc slice  FILE VAR [-d dim,start[,stop] ...] [--limit N]
+    hpc-nc diff   FILE_A FILE_B [--var V ...]
+
+FILE is absolute or ``role:relative``. Indices are 0-based, negative counts
+from the end, and ``stop`` is inclusive, as in NCO: ``-d time,-1`` is the
+last time, ``-d lev,0,9`` the first ten levels. A mean is unweighted unless
+``--weights`` names a variable (``gw``, ``area``, ...) whose dimensions are a
+subset of VAR's.
+
+Each call reads at most ``nc_max_read_mb`` of variable data (site file,
+default 100 MB), computed from shapes before anything is read. Past it the
+call is refused: narrow with ``-d``, or do the work in a trusted script.
+With no ``numpy``/``netCDF4`` on the cluster, ``header`` falls back to
+``ncdump -h``; the others say what is missing.
+
+Exit codes:
+    0    printed
+    64   usage error, unknown site or role
+    65   refused: over the read cap, or too many values for a slice
+    66   no such file, variable, dimension or index
+    69   no ControlMaster socket
+    70   the cluster can't run it (no Python libraries), or it failed
+    124  timeout
+    255  ssh transport failure
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the installed skill
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hpctether import nc_remote, transport
+from hpctether import site as site_mod
+
+EXIT_REFUSED = 65
+EXIT_MISSING = 66
+EXIT_REMOTE = 70
+_MISSING = {"not_found", "unreadable", "no_variable", "bad_dim", "bad_index",
+            "not_numeric", "bad_weights"}
+_DIM_RE = re.compile(r"^([^,\s]+),(-?\d+)(?:,(-?\d+))?$")
+
+
+def resolve(target, raw: str) -> str:
+    return target.remote_path(raw)
+
+
+def parse_dims(specs: list[str]) -> list:
+    out = []
+    for spec in specs or []:
+        m = _DIM_RE.match(spec)
+        if not m:
+            raise ValueError(f"-d {spec!r}: expected dim,start or dim,start,stop (integers)")
+        stop = int(m.group(3)) if m.group(3) is not None else None
+        out.append([m.group(1), int(m.group(2)), stop])
+    return out
+
+
+def fmt(x) -> str:
+    if x is None:
+        return "-"
+    if isinstance(x, float):
+        return f"{x:.6g}"
+    return str(x)
+
+
+def human_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1000 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1000
+    return str(n)
+
+
+def show_header(r: dict) -> None:
+    print(f"{r['path']}  ({r.get('format', '?')})")
+    if r["dims"]:
+        print("dimensions:")
+        for d in r["dims"]:
+            print(f"  {d['name']} = {d['size']}{' (unlimited)' if d['unlimited'] else ''}")
+    print("variables:")
+    for v in r["vars"]:
+        a = v["attrs"]
+        bits = [f"{k}={a[k]}" for k in ("units", "long_name") if k in a]
+        print(f"  {v['dtype']} {v['name']}({', '.join(v['dims'])})  {'  '.join(bits)}".rstrip())
+    if r.get("global_attrs"):
+        print("global attributes:")
+        for k, val in r["global_attrs"].items():
+            print(f"  {k} = {val}")
+    if r.get("groups"):
+        print(f"groups (not read by hpc-nc): {', '.join(r['groups'])}")
+
+
+def _sel(r: dict) -> str:
+    return ", ".join(f"{d}={a}" if a == b else f"{d}={a}:{b}"
+                     for d, (a, b) in zip(r["dims"], r["selection"]))
+
+
+def show_stats(r: dict) -> None:
+    units = f" [{r['units']}]" if r.get("units") else ""
+    print(f"{r['var']}({_sel(r)}){units}  {r['values']} values, "
+          f"{human_bytes(r['bytes_read'])} read")
+    print(f"  min {fmt(r['min'])}  max {fmt(r['max'])}  mean {fmt(r['mean'])} (unweighted)"
+          f"  std {fmt(r['std'])}  over {r['count']} finite values")
+    if "weights" in r:
+        print(f"  weighted mean ({r['weights']}) {fmt(r['weighted_mean'])}")
+    print(f"  nan {r['nan']}  inf {r['inf']}  fill/masked {r['fill']}")
+
+
+def show_slice(r: dict) -> None:
+    units = f" [{r['units']}]" if r.get("units") else ""
+    print(f"{r['var']}({_sel(r)}){units}  shape {tuple(r['shape'])}")
+    for c in r["coords"]:
+        shown = c.get("decoded") or c["values"]
+        print(f"  {c['name']}: {', '.join(fmt(x) for x in shown)}"
+              + (f"  [{c['units']}]" if c.get("units") and "decoded" not in c else ""))
+    print("  values (row-major, '-' = fill): " + ", ".join(fmt(x) for x in r["values"]))
+
+
+def show_diff(r: dict) -> None:
+    print(f"A {r['path']}\nB {r['path_b']}")
+    for key, label in (("dims_only_a", "dims only in A"), ("dims_only_b", "dims only in B"),
+                       ("vars_only_a", "vars only in A"), ("vars_only_b", "vars only in B"),
+                       ("global_attrs_changed", "global attributes that differ")):
+        if r.get(key):
+            print(f"{label}: {', '.join(r[key])}")
+    for k, (a, b) in (r.get("dims_resized") or {}).items():
+        print(f"dim {k}: {a} -> {b}")
+    for name, notes in (r.get("vars_changed_meta") or {}).items():
+        print(f"{name}: {'; '.join(notes)}")
+    if r.get("data") is None:
+        print(f"data not compared: {r.get('data_skipped')}")
+        return
+    if not r["data"]:
+        print(f"data: identical in all {r['data_compared']} compared variable(s)")
+    for name, d in r["data"].items():
+        print(f"{name}: {d['differing']} values differ, max |A-B| {fmt(d['max_abs_diff'])} at {d['at']}")
+
+
+def run(target, request: dict, timeout: int):
+    result = transport.run_capture(target, nc_remote.payload(request), timeout=timeout)
+    lines = [l for l in result.stdout.splitlines() if l.strip()]
+    try:
+        return json.loads(lines[-1]), result
+    except (IndexError, json.JSONDecodeError):
+        return None, result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(allow_abbrev=False, prog="hpc-nc", description=__doc__.split("\n\n")[0],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--site", metavar="NAME",
+                        help="site name from ~/.config/hpc-tether/sites/*.toml")
+    parser.add_argument("--json", action="store_true", help="print the raw JSON result")
+    parser.add_argument("--timeout", type=int, default=300, metavar="SEC",
+                        help="local wall-clock limit (default 300)")
+    sub = parser.add_subparsers(dest="op", required=True)
+    p = sub.add_parser("header", help="dimensions, variables, attributes")
+    p.add_argument("file")
+    p.add_argument("--var", action="append", default=[], help="only these variables")
+    for name, helptext in (("stats", "min/max/mean/std and NaN/Inf/fill counts"),
+                           ("slice", "the values themselves")):
+        p = sub.add_parser(name, help=helptext)
+        p.add_argument("file")
+        p.add_argument("var")
+        p.add_argument("-d", dest="dims", action="append", default=[], metavar="DIM,START[,STOP]")
+        if name == "stats":
+            p.add_argument("--weights", metavar="WVAR",
+                           help="weight the mean by this variable (its dims within VAR's)")
+        else:
+            p.add_argument("--limit", type=int, default=200,
+                           help="most values to print (default 200)")
+    p = sub.add_parser("diff", help="structure, attributes and data of two files")
+    p.add_argument("file")
+    p.add_argument("file_b")
+    p.add_argument("--var", action="append", default=[], help="compare only these variables")
+    args = parser.parse_args(argv)
+
+    try:
+        target = site_mod.load(args.site)
+        request = {"op": args.op, "path": resolve(target, args.file),
+                   "cap": target.nc_max_read_mb * 1_000_000}
+        if args.op == "diff":
+            request["path_b"] = resolve(target, args.file_b)
+        if args.op in ("header", "diff"):
+            request["vars"] = args.var
+        if args.op in ("stats", "slice"):
+            request.update(var=args.var, dims=parse_dims(args.dims))
+        if args.op == "stats" and args.weights:
+            request["weights"] = args.weights
+        if args.op == "slice":
+            request["limit"] = max(1, args.limit)
+    except (site_mod.SiteError, ValueError) as exc:
+        print(f"hpc-nc: {exc}", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    try:
+        r, result = run(target, request, args.timeout)
+        if r is None and args.op == "header":
+            r = None  # handled below with the fallback
+        if (r is None or r.get("error") == "missing_libs") and args.op == "header":
+            why = r["message"] if r else (result.stderr.strip() or "no result")
+            fb = transport.run_capture(target, nc_remote.header_fallback(request["path"]),
+                                       timeout=args.timeout)
+            if fb.returncode == 0:
+                print(f"hpc-nc: no Python netCDF libraries on the cluster ({why}); "
+                      "showing ncdump -h instead", file=sys.stderr)
+                sys.stdout.write(fb.stdout)
+                return transport.EXIT_OK
+    except transport.TransportError as exc:
+        print(f"hpc-nc: {exc}", file=sys.stderr)
+        return exc.code
+
+    if r is None:
+        if result.stderr.strip():
+            print(result.stderr.rstrip(), file=sys.stderr)
+        print(f"hpc-nc: no result from the cluster (exit {result.returncode})", file=sys.stderr)
+        return result.returncode if result.returncode in (124, 255) else EXIT_REMOTE
+
+    if not r.get("ok"):
+        err = r.get("error")
+        msg = r.get("message", "")
+        if err == "missing_libs":
+            print(f"hpc-nc: the cluster Python ({r.get('python')}) can't import numpy and "
+                  f"netCDF4: {msg}. Set the site's [environment] python_bin to an environment that has "
+                  "them.", file=sys.stderr)
+            return EXIT_REMOTE
+        if err in ("too_large", "too_many_values"):
+            hint = ("Narrow the selection with -d. Past the cap the work belongs in a trusted "
+                    "script in a trusted repo, not in hpc-nc; the cap is [policy] nc_max_read_mb in the "
+                    "site file, the user's to set." if err == "too_large" else
+                    "Narrow the selection with -d, or use stats for a summary.")
+            print(f"hpc-nc: REFUSED — {msg}. {hint}", file=sys.stderr)
+            return EXIT_REFUSED
+        print(f"hpc-nc: {msg}", file=sys.stderr)
+        return EXIT_MISSING if err in _MISSING else EXIT_REMOTE
+
+    if args.json:
+        print(json.dumps(r, indent=2))
+    else:
+        {"header": show_header, "stats": show_stats, "slice": show_slice,
+         "diff": show_diff}[args.op](r)
+    return transport.EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

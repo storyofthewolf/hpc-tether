@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Check whether a live SSH ControlMaster socket exists for a site.
+
+Runs ``ssh -O check``, which touches the local control socket only -- it opens
+no connection and costs nothing on the cluster. Cheap enough to be the
+unconditional first action of any session that will touch the remote.
+
+Exit codes:
+    0    master is live; remote work can proceed
+    64   usage error or unknown site
+    69   no live master (message names the exact `ssh -fN <host>` to run)
+    255  ssh transport failure (e.g. ssh not on PATH)
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the installed skill
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hpctether import profile as profile_mod
+from hpctether import site as site_mod
+from hpctether import transport
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(allow_abbrev=False, 
+        prog="hpc-check",
+        description="Report whether a live SSH ControlMaster exists for a site.",
+        epilog="Exit: 0 live, 64 usage/unknown site, 69 no master, 255 ssh failure.",
+    )
+    parser.add_argument(
+        "--site",
+        metavar="NAME",
+        help="site name from ~/.config/hpc-tether/sites/*.toml (default: HPC_TETHER_SITE, or the "
+        "only site defined)",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        target = site_mod.load(args.site)
+    except site_mod.SiteError as exc:
+        print(f"hpc-check: {exc}", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    try:
+        live, message = transport.check_master(target)
+    except transport.TransportError as exc:
+        print(f"hpc-check: {exc}", file=sys.stderr)
+        return exc.code
+
+    # Site-file notes need no connection, so they print either way.
+    notes = [f"{target.name}: site file: {note} (the user's edit; "
+             "still works as written)" for note in target.warnings]
+
+    if live:
+        print(f"{target.name}: master live on {target.host} -- {message}")
+        print(f"{target.name}: profile {target.profile} -- "
+              f"{profile_mod.SUMMARY[target.profile]}")
+        for line in notes:
+            print(line)
+        return transport.EXIT_OK
+
+    print(f"{target.name}: NO master on {target.host} -- {message}", file=sys.stderr)
+    for line in notes:
+        print(line, file=sys.stderr)
+    print(
+        "An agent cannot reopen it; that needs interactive 2FA.\n"
+        f"Ask the user to run:  {transport.reopen_hint(target)}",
+        file=sys.stderr,
+    )
+    return transport.EXIT_NO_MASTER
+
+
+if __name__ == "__main__":
+    sys.exit(main())

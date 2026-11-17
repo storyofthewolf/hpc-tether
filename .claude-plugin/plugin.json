@@ -1,0 +1,20 @@
+{
+  "name": "hpc-tether",
+  "displayName": "HPC Tether",
+  "version": "1.0.0",
+  "description": "Audited access to an HPC cluster over an SSH ControlMaster: four user-set profiles (observe, prepare, operate, improvise; observe runs only the fixed tools), a payload guard that steers the agent away from common mistakes such as deletions and writes outside your write roots, an approval prompt for every write, read-only netCDF inspection, and a SLURM job monitor. Not a security boundary.",
+  "author": {
+    "name": "Eric Wolf"
+  },
+  "repository": "https://github.com/storyofthewolf/hpc-tether",
+  "keywords": [
+    "hpc",
+    "slurm",
+    "ssh",
+    "cluster",
+    "netcdf",
+    "agent",
+    "audit"
+  ],
+  "license": "MIT"
+}

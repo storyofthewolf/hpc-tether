@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""Query SLURM job and queue state, and gate against duplicate submissions.
+
+Three modes:
+
+  (no selector)  current queue for the site user
+  --job ID       merged squeue + sacct view for one job; with --brief, one
+                 line, ``ID STATE ELAPSED EXITCODE``, for a periodic check
+  --name NAME    duplicate-instance gate: EXITS NONZERO if a job with that
+                 name is already queued or running
+
+--name is the important one. It converts "always check for an existing
+instance before proposing a resubmit" from advisory prose into a check that
+holds at the moment context pressure is highest -- and it is what stops two
+jobs racing on a single output directory, double-spending the allocation and
+producing corrupt results that still look plausible.
+
+--json emits normalized records so no caller ever parses column offsets.
+
+SLURM only. Sites declaring another scheduler are rejected at load time.
+
+Exit codes:
+    0    query succeeded; with --name, NO conflicting job exists
+    1    with --name: a job of that name is already queued or running
+    64   usage error or unknown site
+    69   no ControlMaster socket
+    70   remote query failed (squeue/sacct unavailable, errored, or
+         returned output that could not be parsed)
+    124  local timeout
+    255  ssh transport failure
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shlex
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the installed skill
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hpctether import site as site_mod
+from hpctether import transport
+
+EXIT_CONFLICT = 1
+EXIT_REMOTE_QUERY = 70
+
+#: The sacct format string. It lives here, once, rather than in prose to be
+#: retyped -- retyped format strings drift and then columns silently shift.
+SACCT_FORMAT = "JobID,JobName%20,State,Elapsed,MaxRSS,ExitCode"
+
+#: Unit separator: safe against job names containing spaces or pipes.
+#:
+#: This must be the REAL 0x1f byte, embedded directly in the script text we
+#: pipe to bash. It must NOT be the escape sequence ``\x1f``: payloads run
+#: under ``bash``, whose ``echo`` and double quotes leave ``\x1f`` as four
+#: literal characters, so squeue emits a separator that ``str.split("\x1f")``
+#: never finds -- and every row is silently dropped. That was a real bug: the
+#: queue reported empty while a job was running.
+SEP = "\x1f"
+
+#: squeue fields, in the order parsed by _parse_squeue.
+#: The last, %r, says why a job waits (Priority, Resources, QOSMaxJobsPerUser);
+#: without it a PENDING job gives no way to see why.
+SQUEUE_FORMAT = f"%i{SEP}%j{SEP}%T{SEP}%M{SEP}%D{SEP}%r"
+
+# `|| true` here would discard squeue's exit status, and a failed query writes
+# its error to stderr -- leaving empty stdout that is indistinguishable from a
+# genuinely empty queue. That is the one confusion this tool must never make:
+# `--name` green-lights a resubmit on an empty queue, so a controller outage
+# would have cleared the way for a duplicate job on the same output directory.
+# Fail closed with the remote-query code instead.
+_QUEUE_SCRIPT = f"""
+command -v squeue >/dev/null 2>&1 || {{
+  echo "hpc-jobs: squeue not found on $HPC_HOST" >&2
+  exit 70
+}}
+echo "###SQUEUE###"
+if ! squeue --user="$HPC_USER" -h -o "{SQUEUE_FORMAT}"; then
+  echo "hpc-jobs: squeue failed on $HPC_HOST (queue state unknown)" >&2
+  exit 70
+fi
+"""
+
+# Same rule as _QUEUE_SCRIPT: a failed query must not read as an empty result.
+# The asymmetry is that here one source may legitimately come up empty -- a
+# finished job is gone from squeue and present in sacct, and a very recent one
+# can be the reverse -- so neither is required to return rows. What is required
+# is that a query which ERRORED is never silently folded into "no rows"
+#. squeue exits 1 for an unknown job id, which is an answer,
+# not a failure; anything above that is a failure. Both erroring together means
+# the job's state is unknown, and the caller is told so rather than shown blanks.
+_JOB_SCRIPT = f"""
+jobid="$1"
+squeue_rc=0
+sacct_rc=0
+echo "###SQUEUE###"
+if command -v squeue >/dev/null 2>&1; then
+  # stdout passes through; stderr is held so the one expected complaint,
+  # squeue's "Invalid job id" for a job that has left the queue, is dropped.
+  # Any other squeue error is printed and counts as a failure.
+  {{ sq_err=$(squeue --jobs="$jobid" -h -o "{SQUEUE_FORMAT}" 2>&1 1>&3 3>&-) || squeue_rc=$?; }} 3>&1
+  if [ "$squeue_rc" -eq 1 ] && [[ "$sq_err" == *"Invalid job id"* ]]; then squeue_rc=0
+  elif [ -n "$sq_err" ]; then printf '%s\n' "$sq_err" >&2; fi
+else
+  squeue_rc=127
+  echo "hpc-jobs: squeue not found on $HPC_HOST" >&2
+fi
+echo "###SACCT###"
+if command -v sacct >/dev/null 2>&1; then
+  sacct --jobs="$jobid" -n -P --format={SACCT_FORMAT} || sacct_rc=$?
+else
+  sacct_rc=127
+  echo "hpc-jobs: sacct not found on $HPC_HOST" >&2
+fi
+if [ "$squeue_rc" -ne 0 ] && [ "$sacct_rc" -ne 0 ]; then
+  echo "hpc-jobs: both squeue and sacct failed for job $jobid on $HPC_HOST;" \
+       "its state is unknown -- do NOT read this as a finished or absent job" >&2
+  exit 70
+fi
+if [ "$squeue_rc" -ne 0 ]; then
+  echo "hpc-jobs: squeue failed for job $jobid on $HPC_HOST (rc $squeue_rc);" \
+       "any queue state below comes from sacct only" >&2
+fi
+if [ "$sacct_rc" -ne 0 ]; then
+  echo "hpc-jobs: sacct failed for job $jobid on $HPC_HOST (rc $sacct_rc);" \
+       "accounting history is unavailable, not empty" >&2
+fi
+"""
+
+
+def _decode(field: str) -> str:
+    return field.replace("\x1f", "").strip()
+
+
+class ParseError(RuntimeError):
+    """squeue produced output we could not parse into records."""
+
+
+def _parse_squeue(block: str) -> list[dict[str, str | None]]:
+    """Parse squeue output into normalized records.
+
+    Raises ParseError if squeue emitted ANY line that carries no separator --
+    an unreadable line means the queue is not what we can see, and that must
+    never be reported as "(none)", because an empty queue is itself a
+    legitimate answer and the two are indistinguishable to the caller. A row
+    that fails to parse may be the very job a `--name` check is looking for.
+    """
+    records: list[dict[str, str | None]] = []
+    unparsed: list[str] = []
+    for line in block.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split(SEP)
+        if len(parts) < 5:
+            unparsed.append(line)
+            continue
+        records.append(
+            {
+                "jobid": _decode(parts[0]),
+                "name": _decode(parts[1]),
+                "state": _decode(parts[2]),
+                "elapsed": _decode(parts[3]),
+                "exit": None,
+                "nodes": _decode(parts[4]),
+                "reason": _decode(parts[5]) if len(parts) > 5 else None,
+            }
+        )
+    if unparsed:
+        # Any unreadable line fails the parse, not just an all-unreadable
+        # block. A row that does not parse may be the very job a --name check
+        # is looking for, and dropping it silently because its neighbours
+        # parsed turns an unknown into a false "clear".
+        raise ParseError(
+            f"squeue returned {len(unparsed)} line(s) with no field separator "
+            f"alongside {len(records)} readable row(s); queue state cannot be "
+            f"trusted. First unreadable line: {unparsed[0]!r}"
+        )
+    return records
+
+
+def _parse_sacct(block: str) -> list[dict[str, str | None]]:
+    """Parse `sacct -P` (pipe-delimited) output into normalized records."""
+    records: list[dict[str, str | None]] = []
+    for line in block.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|")
+        if len(parts) < 6:
+            continue
+        records.append(
+            {
+                "jobid": parts[0].strip(),
+                "name": parts[1].strip(),
+                "state": parts[2].strip(),
+                "elapsed": parts[3].strip(),
+                "maxrss": parts[4].strip() or None,
+                "exit": parts[5].strip() or None,
+                "nodes": None,
+            }
+        )
+    return records
+
+
+def _split_sections(stdout: str) -> dict[str, str]:
+    """Split the remote output on ###MARKER### lines."""
+    sections: dict[str, str] = {}
+    current = None
+    buffer: list[str] = []
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("###") and stripped.endswith("###"):
+            if current is not None:
+                sections[current] = "\n".join(buffer)
+            current = stripped.strip("#").lower()
+            buffer = []
+        elif current is not None:
+            buffer.append(line)
+    if current is not None:
+        sections[current] = "\n".join(buffer)
+    return sections
+
+
+def _run(target, script: str, argv_args: list[str], timeout: int):
+    """Run a remote query script, forwarding positional args via `bash -s --`."""
+    # Positional args reach the script as $1.. because run_remote pipes to
+    # `bash -s`; we inline them by prepending a `set --` line, which keeps the
+    # argv-only contract intact (nothing is interpolated into a command line).
+    if argv_args:
+        quoted = " ".join(shlex.quote(a) for a in argv_args)
+        script = f"set -- {quoted}\n{script}"
+    return transport.run_capture(target, script, timeout=timeout)
+
+
+def _print_table(records: list[dict[str, str | None]], title: str) -> None:
+    if not records:
+        print(f"{title}: (none)")
+        return
+    print(f"{title}:")
+    headers = ("JOBID", "NAME", "STATE", "ELAPSED", "EXIT", "NODES")
+    rows = [
+        (
+            str(r.get("jobid") or "-"),
+            str(r.get("name") or "-"),
+            str(r.get("state") or "-"),
+            str(r.get("elapsed") or "-"),
+            str(r.get("exit") or "-"),
+            str(r.get("nodes") or "-"),
+        )
+        for r in records
+    ]
+    # squeue rows carry a reason; sacct rows don't, so its table keeps six columns.
+    if any("reason" in r for r in records):
+        headers += ("REASON",)
+        rows = [row + (str(r.get("reason") or "-"),) for row, r in zip(rows, records)]
+    widths = [
+        max(len(headers[i]), max(len(row[i]) for row in rows))
+        for i in range(len(headers))
+    ]
+    print("  " + "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)))
+    for row in rows:
+        print("  " + "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
+
+
+#: States that mean a job is occupying (or about to occupy) its output dir.
+ACTIVE_STATES = frozenset(transport.ACTIVE_JOB_STATES)
+
+
+def brief(jobid: str, queue: list[dict], accounting: list[dict]) -> dict:
+    """One record for one job from both sources.
+
+    squeue is live, so its state and elapsed time win while the job is in
+    the queue; sacct supplies the exit code, and everything once the job has
+    left the queue. Of sacct's rows the job's own (not ``ID.batch``,
+    ``ID.0``) is used. NOT_FOUND when neither source knows the id.
+    """
+    live = next((r for r in queue if r["jobid"] == jobid), queue[0] if queue else None)
+    acct = next((r for r in accounting if r["jobid"] == jobid),
+                next((r for r in accounting if "." not in (r["jobid"] or "")), None))
+    rec = {"jobid": jobid, "state": "NOT_FOUND", "elapsed": None, "exit": None}
+    if acct:
+        rec.update(state=acct["state"], elapsed=acct["elapsed"], exit=acct["exit"])
+    if live:
+        rec.update(state=live["state"], elapsed=live["elapsed"])
+    return rec
+
+
+def brief_line(rec: dict) -> str:
+    # sacct's "CANCELLED by 12345" is the state CANCELLED plus who did
+    # it; the brief line keeps the state alone, one word scripts can match
+    # (not CANCELLED_by_12345).
+    state = (rec["state"] or "-").split()[0]
+    return f"{rec['jobid']} {state} {rec['elapsed'] or '-'} {rec['exit'] or '-'}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(allow_abbrev=False, 
+        prog="hpc-jobs",
+        description="Query SLURM queue state; gate against duplicate submissions.",
+        epilog=(
+            "Exit: 0 ok (or --name found no conflict), 1 --name conflict, "
+            "64 usage, 69 no master, 70 remote query failed, 124 timeout, "
+            "255 ssh failure."
+        ),
+    )
+    parser.add_argument("--site", metavar="NAME", help="site name from ~/.config/hpc-tether/sites/*.toml")
+    parser.add_argument("--user", metavar="USER", help="override the site's user")
+    parser.add_argument("--job", metavar="ID", help="merged squeue+sacct view for one job")
+    parser.add_argument(
+        "--brief",
+        action="store_true",
+        help="with --job: one line, ID STATE ELAPSED EXITCODE (- when not "
+        "known; NOT_FOUND when neither squeue nor sacct knows the id). The "
+        "cheap way to check on a job periodically",
+    )
+    parser.add_argument(
+        "--name",
+        metavar="NAME",
+        help="duplicate-instance gate: exit 1 if a job with this name is "
+        "already queued or running",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="emit normalized JSON records"
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=60, metavar="SEC", help="local timeout (default 60)"
+    )
+    args = parser.parse_args(argv)
+
+    if args.job and args.name:
+        print("hpc-jobs: --job and --name are mutually exclusive", file=sys.stderr)
+        return transport.EXIT_USAGE
+    if args.brief and not args.job:
+        print("hpc-jobs: --brief needs --job ID", file=sys.stderr)
+        return transport.EXIT_USAGE
+    # Both reach squeue/sacct command lines on the cluster: refuse anything
+    # that is not the shape SLURM gives them, so neither reads as an option.
+    if args.job and not transport.JOBID_RE.match(args.job):
+        print(f"hpc-jobs: --job must be a SLURM job id such as 123, 123_4 or "
+              f"123+1; got {args.job!r}", file=sys.stderr)
+        return transport.EXIT_USAGE
+    if args.user and not transport.USER_RE.match(args.user):
+        print(f"hpc-jobs: --user {args.user!r} is not a user name", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    try:
+        target = site_mod.load(args.site)
+    except site_mod.SiteError as exc:
+        print(f"hpc-jobs: {exc}", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    if args.user:
+        target = site_mod.Site(
+            name=target.name,
+            host=target.host,
+            scheduler=target.scheduler,
+            user=args.user,
+            paths=target.paths,
+            source=target.source,
+        )
+
+    try:
+        if args.job:
+            result = _run(target, _JOB_SCRIPT, [args.job], args.timeout)
+        else:
+            result = _run(target, _QUEUE_SCRIPT, [], args.timeout)
+    except transport.TransportError as exc:
+        print(f"hpc-jobs: {exc}", file=sys.stderr)
+        return exc.code
+
+    if result.stderr.strip():
+        print(result.stderr.rstrip(), file=sys.stderr)
+    if result.returncode == EXIT_REMOTE_QUERY:
+        return EXIT_REMOTE_QUERY
+    if result.returncode not in (0, EXIT_REMOTE_QUERY):
+        return result.returncode
+
+    sections = _split_sections(result.stdout)
+    try:
+        queue = _parse_squeue(sections.get("squeue", ""))
+    except ParseError as exc:
+        # Never degrade to "(none)" here. With --name that would read as
+        # "clear" and green-light a duplicate submission onto a live job's
+        # output directory.
+        print(f"hpc-jobs: {exc}", file=sys.stderr)
+        return EXIT_REMOTE_QUERY
+    accounting = _parse_sacct(sections.get("sacct", ""))
+
+    # --- duplicate-instance gate -------------------------------------------
+    if args.name:
+        conflicts = [
+            r
+            for r in queue
+            if r["name"] == args.name
+            and (r["state"] or "").upper().split()[0] in ACTIVE_STATES
+        ]
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "name": args.name,
+                        "conflict": bool(conflicts),
+                        "jobs": conflicts,
+                    },
+                    indent=2,
+                )
+            )
+        elif conflicts:
+            print(
+                f"CONFLICT: {len(conflicts)} job(s) named {args.name!r} already "
+                f"queued or running on {target.name}.",
+                file=sys.stderr,
+            )
+            _print_table(conflicts, "existing")
+            print(
+                "Do NOT resubmit. Two jobs writing one output directory race on "
+                "files, double-spend the allocation, and produce corrupt results "
+                "that still look plausible.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"clear: no job named {args.name!r} queued or running.")
+        return EXIT_CONFLICT if conflicts else transport.EXIT_OK
+
+    # --- reporting ----------------------------------------------------------
+    if args.brief:
+        rec = brief(args.job, queue, accounting)
+        print(json.dumps(rec) if args.json else brief_line(rec))
+        return transport.EXIT_OK
+
+    if args.json:
+        payload = {"site": target.name, "user": target.user, "queue": queue}
+        if args.job:
+            payload["accounting"] = accounting
+        print(json.dumps(payload, indent=2))
+        return transport.EXIT_OK
+
+    if args.job:
+        _print_table(queue, f"squeue (job {args.job})")
+        print()
+        _print_table(accounting, f"sacct (job {args.job})")
+        print(
+            "\nNote: TotalCPU is not shown and is not a progress signal -- it "
+            "reads 00:00:00 for processes not launched under srun. See "
+            "reference/job-diagnostics.md."
+        )
+    else:
+        _print_table(queue, f"queue for {target.user} on {target.name}")
+
+    return transport.EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

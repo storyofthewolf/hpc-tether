@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""Read-only probes into a running SLURM job: processes, I/O progress, open files.
+
+All three subcommands wrap `timeout 30 srun --jobid=<ID> --overlap ...`. The
+timeout is structural, not something to remember: `srun --overlap` must obtain
+a slot from SLURM, and on a node already saturated by the job's own work it can
+block indefinitely with no output at all. A probe that returned quickly earlier
+in a run may hang later as the node fills.
+
+Subcommands:
+    ps   process table, sorted by CPU. The highest-value single probe.
+    io   sample /proc/<pid>/io twice --interval apart, compute the rchar delta,
+         and print a PROGRESSING / STALLED verdict alongside raw counters.
+         Making this one call keeps the measurement off two turns with
+         arithmetic in between. PROGRESSING is conclusive; STALLED is one
+         signal (flat rchar also means compute-bound, mmap, write-only, or an
+         MPI barrier) -- see reference/job-diagnostics.md §4 before calling a
+         hang.
+    fd   open file descriptors filtered to .nc and .h5
+
+Every probe here is read-only by construction. None of them can scancel,
+resubmit, or write anything. They do wrap `srun`, which SKILL.md otherwise
+puts at interpreter tier: the payloads here are fixed and read-only, so the
+skill carves them out explicitly. `--overlap` still consumes a job step, so a
+probe can block on a saturated node -- that is the probe failing, not the job.
+
+Exit codes:
+    0    probe completed
+    1    io: verdict is STALLED (rchar did not advance)
+    64   usage error or unknown site
+    69   no ControlMaster socket
+    75   srun could not obtain a slot within 30s (fall back to non-slot probes)
+    124  local timeout
+    255  ssh transport failure
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shlex
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the installed skill
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hpctether import site as site_mod
+from hpctether import transport
+
+EXIT_STALLED = 1
+EXIT_SRUN_TIMEOUT = 75
+
+#: A process id is digits and nothing else.
+_PID_RE = re.compile(r"^[0-9]+$")
+
+#: A SLURM job id (shared with hpc-jobs). Deliberately narrow -- anything
+#: outside this set reaches a shell, so the default must be refusal, not best
+#: effort.
+_JOBID_RE = transport.JOBID_RE
+
+#: srun probe wrapper. `timeout 30` is applied on the remote side so a blocked
+#: slot request dies there rather than tying up the local timeout budget.
+SRUN_TIMEOUT = 30
+
+_PS_SCRIPT = """
+jobid="$1"
+timeout {t} srun --jobid="$jobid" --overlap \\
+  ps -u "$HPC_USER" -o pid,etime,pcpu,rss,stat,wchan:20,args --sort=-pcpu
+rc=$?
+if [ "$rc" -eq 124 ]; then exit 75; fi
+exit "$rc"
+"""
+
+_FD_SCRIPT = """
+jobid="$1"
+pid="$2"
+set +e
+raw=$(timeout {t} srun --jobid="$jobid" --overlap \\
+  sh -c 'ls -l /proc/'"$pid"'/fd 2>/dev/null')
+rc=$?
+set -e
+if [ "$rc" -eq 124 ]; then exit 75; fi
+printf '%s\\n' "$raw" | grep -iE '\\.nc|\\.h5' || true
+exit 0
+"""
+
+# Both samples are taken inside ONE srun slot: acquiring the slot is the
+# expensive, blockable part, and sampling twice in one allocation also removes
+# any chance of the two samples landing on different nodes.
+_IO_SCRIPT = """
+jobid="$1"
+pid="$2"
+interval="$3"
+timeout {t} srun --jobid="$jobid" --overlap sh -c '
+  p="'"$pid"'"
+  n="'"$interval"'"
+  echo "###SAMPLE1###"
+  cat /proc/$p/io 2>/dev/null || echo "READ_FAILED"
+  sleep "$n"
+  echo "###SAMPLE2###"
+  cat /proc/$p/io 2>/dev/null || echo "READ_FAILED"
+'
+rc=$?
+if [ "$rc" -eq 124 ]; then exit 75; fi
+exit "$rc"
+"""
+
+
+def _sections(stdout: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    current = None
+    buf: list[str] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if s.startswith("###") and s.endswith("###"):
+            if current:
+                out[current] = "\n".join(buf)
+            current = s.strip("#").lower()
+            buf = []
+        elif current:
+            buf.append(line)
+    if current:
+        out[current] = "\n".join(buf)
+    return out
+
+
+def _parse_io(block: str) -> dict[str, int]:
+    counters: dict[str, int] = {}
+    for line in block.splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        try:
+            counters[key.strip()] = int(value.strip())
+        except ValueError:
+            continue
+    return counters
+
+
+def _human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def _srun_timeout_message(kind: str) -> str:
+    return (
+        f"hpc-probe {kind}: srun could not obtain a slot within {SRUN_TIMEOUT}s.\n"
+        "The node is likely saturated by the job's own work. Do NOT retry in a "
+        "loop -- fall back to probes that need no slot:\n"
+        "  hpc-jobs --job <ID>      queue and accounting state\n"
+        "  hpc-read LOG --tail N    the end of the job log\n"
+        "  hpc-ls LOG               the log's size and modification time\n"
+        "See reference/job-diagnostics.md."
+    )
+
+
+def _cmd_ps(target, args) -> int:
+    script = _PS_SCRIPT.format(t=SRUN_TIMEOUT)
+    result = _run(target, script, [args.job], args.timeout)
+    if result.returncode == EXIT_SRUN_TIMEOUT:
+        print(_srun_timeout_message("ps"), file=sys.stderr)
+        return EXIT_SRUN_TIMEOUT
+    sys.stdout.write(result.stdout)
+    if result.stderr.strip():
+        print(result.stderr.rstrip(), file=sys.stderr)
+    if result.returncode == 0:
+        print(
+            "\nRead the parent process line: a driver script's command line names "
+            "the input it is currently on -- ground truth for whether it has "
+            "advanced, more reliable than the log."
+        )
+    return result.returncode
+
+
+def _cmd_fd(target, args) -> int:
+    if not args.pid:
+        print("hpc-probe fd: --pid is required", file=sys.stderr)
+        return transport.EXIT_USAGE
+    script = _FD_SCRIPT.format(t=SRUN_TIMEOUT)
+    result = _run(target, script, [args.job, args.pid], args.timeout)
+    if result.returncode == EXIT_SRUN_TIMEOUT:
+        print(_srun_timeout_message("fd"), file=sys.stderr)
+        return EXIT_SRUN_TIMEOUT
+    out = result.stdout.strip()
+    print(out if out else "(no open .nc or .h5 descriptors)")
+    if result.stderr.strip():
+        print(result.stderr.rstrip(), file=sys.stderr)
+    return result.returncode
+
+
+def _cmd_io(target, args) -> int:
+    if not args.pid:
+        print("hpc-probe io: --pid is required", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    # The srun wrapper has to cover slot acquisition AND both samples. Using
+    # the bare SRUN_TIMEOUT here gave the default 30s interval a 30s remote
+    # budget, so the sleep alone consumed all of it and a healthy job reported
+    # a slot timeout. Acquisition and sampling are separate
+    # costs and are budgeted separately.
+    script = _IO_SCRIPT.format(t=SRUN_TIMEOUT + args.interval)
+    # Local timeout must outlast the whole remote budget plus ssh round trip.
+    timeout = max(args.timeout, args.interval + SRUN_TIMEOUT + 30)
+    result = _run(target, script, [args.job, args.pid, str(args.interval)], timeout)
+
+    if result.returncode == EXIT_SRUN_TIMEOUT:
+        print(_srun_timeout_message("io"), file=sys.stderr)
+        return EXIT_SRUN_TIMEOUT
+    if result.stderr.strip():
+        print(result.stderr.rstrip(), file=sys.stderr)
+
+    sections = _sections(result.stdout)
+    first = _parse_io(sections.get("sample1", ""))
+    second = _parse_io(sections.get("sample2", ""))
+
+    if not first or not second:
+        print(
+            f"hpc-probe io: could not read /proc/{args.pid}/io on the job's node "
+            "(process may have exited, or the pid is on a different node).",
+            file=sys.stderr,
+        )
+        return transport.EXIT_USAGE
+
+    rchar_delta = second.get("rchar", 0) - first.get("rchar", 0)
+    wchar_delta = second.get("wchar", 0) - first.get("wchar", 0)
+    syscr_delta = second.get("syscr", 0) - first.get("syscr", 0)
+    progressing = rchar_delta > 0
+
+    verdict = "PROGRESSING" if progressing else "STALLED"
+    mean_read = (rchar_delta / syscr_delta) if syscr_delta > 0 else 0.0
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "jobid": args.job,
+                    "pid": args.pid,
+                    "interval": args.interval,
+                    "verdict": verdict,
+                    "rchar_delta": rchar_delta,
+                    "wchar_delta": wchar_delta,
+                    "syscr_delta": syscr_delta,
+                    "mean_read_bytes": round(mean_read, 1),
+                    "sample1": first,
+                    "sample2": second,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"{verdict}  (pid {args.pid}, job {args.job}, {args.interval}s apart)")
+        print(f"  rchar delta : {rchar_delta:>15,}  ({_human(rchar_delta)})")
+        print(f"  wchar delta : {wchar_delta:>15,}  ({_human(wchar_delta)})")
+        print(f"  syscr delta : {syscr_delta:>15,}")
+        if syscr_delta > 0:
+            print(f"  mean read   : {_human(mean_read)} per read syscall")
+        print()
+        if progressing:
+            print("rchar is rising: the process is reading and is not stuck.")
+            if wchar_delta <= 0:
+                print(
+                    "wchar is flat: ingest phase, output not being emitted yet. "
+                    "This is normal early in a run."
+                )
+            if 0 < mean_read < 65536:
+                print(
+                    "Mean read is small for a parallel filesystem (which wants "
+                    "MB-sized reads): possible strided or unchunked access. "
+                    "Check the file format BEFORE tuning -- see "
+                    "reference/job-diagnostics.md."
+                )
+        else:
+            print(
+                "No read activity observed over this interval: rchar did not "
+                "advance. That is not the same as blocked -- a process that is "
+                "compute-bound, in an MPI barrier, writing only, or reading "
+                "through mmap advances no rchar while working normally.\n"
+                "This is ONE signal and it is not conclusive. Corroborate "
+                "before concluding anything: compare a longer interval, check "
+                "pcpu in `hpc-probe ps` (busy CPU with flat rchar is compute, "
+                "not a hang), and read the log's last timestamp. See "
+                "reference/job-diagnostics.md S4.\n"
+                "Escalate and ask the user before acting -- do NOT scancel or "
+                "resubmit on this alone."
+            )
+        print(
+            "\nNote: read_bytes is 0 on Lustre and GPFS (no local block device). "
+            "That is not evidence of no I/O; rchar is the signal."
+        )
+
+    return EXIT_STALLED if not progressing else transport.EXIT_OK
+
+
+def _run(target, script: str, argv_args: list[str], timeout: int):
+    if argv_args:
+        quoted = " ".join(shlex.quote(a) for a in argv_args)
+        script = f"set -- {quoted}\n{script}"
+    return transport.run_capture(target, script, timeout=timeout)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(allow_abbrev=False, 
+        prog="hpc-probe",
+        description="Read-only probes into a running SLURM job.",
+        epilog=(
+            "Exit: 0 ok, 1 io STALLED, 64 usage, 69 no master, "
+            "75 srun slot timeout, 124 local timeout, 255 ssh failure."
+        ),
+    )
+    parser.add_argument(
+        "subcommand",
+        choices=("ps", "io", "fd"),
+        help="ps: process table; io: rchar-delta progress verdict; fd: open .nc/.h5",
+    )
+    parser.add_argument("--job", required=True, metavar="ID", help="SLURM job id")
+    parser.add_argument(
+        "--pid",
+        metavar="PID",
+        help="target pid (required for io, fd); digits only",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=30,
+        metavar="SEC",
+        help="io: seconds between the two /proc samples (default 30)",
+    )
+    parser.add_argument("--site", metavar="NAME", help="site name from ~/.config/hpc-tether/sites/*.toml")
+    parser.add_argument(
+        "--json", action="store_true", help="io: emit the verdict and counters as JSON"
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=120, metavar="SEC", help="local timeout"
+    )
+    args = parser.parse_args(argv)
+
+    if args.interval <= 0:
+        print("hpc-probe: --interval must be positive", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    # --job and --pid are interpolated into a nested `sh -c` inside the srun
+    # payload, where the inner quoting puts them back into shell source. Text
+    # that is not a plain identifier therefore runs as a command: a --pid of
+    # `1; printf x` executed that printf. Validate the
+    # shapes the schedulers actually produce and refuse everything else --
+    # this is the only thing standing between the two flags and injection.
+    if args.pid is not None and not _PID_RE.match(args.pid):
+        print(
+            f"hpc-probe: --pid must be digits only, got {args.pid!r}",
+            file=sys.stderr,
+        )
+        return transport.EXIT_USAGE
+
+    if not _JOBID_RE.match(args.job):
+        print(
+            f"hpc-probe: --job must be a SLURM job id -- digits, optionally "
+            f"with an array or het-job suffix such as 123_4 or 123+1; "
+            f"got {args.job!r}",
+            file=sys.stderr,
+        )
+        return transport.EXIT_USAGE
+
+    try:
+        target = site_mod.load(args.site)
+    except site_mod.SiteError as exc:
+        print(f"hpc-probe: {exc}", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    try:
+        if args.subcommand == "ps":
+            return _cmd_ps(target, args)
+        if args.subcommand == "io":
+            return _cmd_io(target, args)
+        return _cmd_fd(target, args)
+    except transport.TransportError as exc:
+        print(f"hpc-probe: {exc}", file=sys.stderr)
+        return exc.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""Pull one remote file to the local machine over the ControlMaster.
+
+Half of the pull → edit locally → push protocol (see
+reference/file-transfer.md). Significant edits to remote files never happen
+over ssh: the file comes down, gets edited with real local tools, and goes
+back via hpc-push, which detects drift against the manifest entry this tool
+records.
+
+Behavior:
+  * size preflight with a single remote ``stat`` — a multi-GB pull needs
+    ``--force-size`` (default cap 2 GB)
+  * the session transfer budget (hpctether/budget.py): a pull that would
+    take this session's inbound total past its budget exits 77 until the
+    user agrees to ``--budget-add SIZE``
+  * refuses to overwrite an existing local file without ``--overwrite``
+    (the local copy may hold edits that exist nowhere else)
+  * records remote path/size/mtime + content sha256 in the manifest
+    (``~/.cache/hpc-tether/manifest.json``) for hpc-push's drift check
+  * destination defaults to the current working directory — never an agent
+    scratch directory, and never inside the skill's own source tree (a
+    relative default resolves against the caller's cwd, so invoking bin/
+    after cd'ing here would otherwise deposit data among the sources)
+
+Paths may be absolute or ``role:relative/path`` (see hpc-read).
+
+Exit codes:
+    0    pulled and recorded
+    64   usage error or unknown site/role
+    65   file exceeds the size cap (pass --force-size) or local file exists
+         (pass --overwrite)
+    77   would exceed the session transfer budget (pass --budget-add SIZE
+         once the user agrees); nothing was sent
+    66   remote file missing or unreadable
+    69   no ControlMaster socket
+    124  timeout
+    255  ssh/scp transport failure
+"""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the installed skill
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hpctether import audit, budget, manifest
+from hpctether import site as site_mod
+from hpctether import transport
+
+EXIT_REFUSED = 65
+EXIT_NOINPUT = 66
+DEFAULT_MAX_BYTES = 2 * 1024**3
+
+_STAT_SCRIPT = """
+p="$1"
+if [ ! -f "$p" ] || [ ! -r "$p" ]; then
+  echo "not a readable file: $p" >&2
+  exit 66
+fi
+stat -c '%s %Y' -- "$p"
+"""
+
+
+def _resolve(target: site_mod.Site, raw: str) -> str:
+    return target.remote_path(raw)
+
+
+def _human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def remote_stat(target: site_mod.Site, remote_path: str, timeout: int) -> tuple[int, int]:
+    """Return (size, mtime) of the remote file, or raise TransportError/SystemExit."""
+    import shlex
+
+    script = f"set -- {shlex.quote(remote_path)}\n{_STAT_SCRIPT}"
+    result = transport.run_capture(target, script, timeout=timeout,
+                                   audit_extra={"step": "sizecheck"})
+    if result.returncode == EXIT_NOINPUT:
+        print(f"hpc-pull: {result.stderr.strip()}", file=sys.stderr)
+        raise SystemExit(EXIT_NOINPUT)
+    if result.returncode != 0:
+        if result.stderr.strip():
+            print(result.stderr.rstrip(), file=sys.stderr)
+        raise SystemExit(result.returncode)
+    try:
+        size_s, mtime_s = result.stdout.split()[:2]
+        return int(size_s), int(mtime_s)
+    except (ValueError, IndexError):
+        print(
+            f"hpc-pull: could not parse remote stat output: {result.stdout!r}",
+            file=sys.stderr,
+        )
+        raise SystemExit(transport.EXIT_SSH_FAILURE) from None
+
+
+def scp(target: site_mod.Site, remote_path: str, dst: Path, pull: bool, timeout: int) -> int:
+    """One scp over the master. argv list; remote path quoted for the far side."""
+    import shlex
+
+    remote = f"{target.host}:{shlex.quote(remote_path)}"
+    pair = [remote, str(dst)] if pull else [str(dst), remote]
+    argv = ["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *pair]
+    detail = f"{pair[0]} -> {pair[1]}"
+    with audit.Timer() as clock:
+        try:
+            proc = subprocess.run(argv, timeout=timeout, check=False)
+        except subprocess.TimeoutExpired:
+            audit.record("scp", target.name, target.host, detail, transport.EXIT_TIMEOUT,
+                         seconds=timeout)
+            print(f"hpc-pull: scp exceeded {timeout}s", file=sys.stderr)
+            return transport.EXIT_TIMEOUT
+    extra = None
+    if proc.returncode == 0 and pull and dst.is_file():
+        extra = audit.transfer_fields("in", 1, dst.stat().st_size, remote_path, dst)
+    audit.record("scp", target.name, target.host, detail, proc.returncode,
+                 seconds=clock.seconds, extra=extra)
+    return proc.returncode
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(allow_abbrev=False, 
+        prog="hpc-pull",
+        description="Pull one remote file locally and record it for hpc-push.",
+        epilog=(
+            "Exit: 0 ok, 64 usage, 65 refused (size/overwrite), 66 remote file "
+            "missing, 69 no master, 77 over the session transfer budget, "
+            "124 timeout, 255 transport failure."
+        ),
+    )
+    parser.add_argument("src", metavar="SRC", help="remote file: absolute or role:relative")
+    parser.add_argument(
+        "dst",
+        metavar="DST",
+        nargs="?",
+        help="local destination (default: ./<basename of SRC>)",
+    )
+    parser.add_argument("--site", metavar="NAME", help="site name from ~/.config/hpc-tether/sites/*.toml")
+    parser.add_argument(
+        "--force-size",
+        action="store_true",
+        help=f"pull even if larger than {_human(DEFAULT_MAX_BYTES)}",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace an existing local file (its edits are lost)",
+    )
+    parser.add_argument(
+        "--budget-add", metavar="SIZE",
+        help="raise this session's transfer budget by SIZE (e.g. 10G); pass "
+        "only after the user agrees",
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=600, metavar="SEC",
+        help="scp time limit (default 600)",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        add = budget.parse_size(args.budget_add) if args.budget_add else 0
+    except ValueError as exc:
+        print(f"hpc-pull: --budget-add: {exc}", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    try:
+        target = site_mod.load(args.site)
+        remote_path = _resolve(target, args.src)
+    except site_mod.SiteError as exc:
+        print(f"hpc-pull: {exc}", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    dst = Path(args.dst).expanduser() if args.dst else Path(remote_path).name
+    dst = Path(dst)
+    if dst.is_dir():
+        dst = dst / Path(remote_path).name
+
+    # A relative destination resolves against whatever cwd the caller happens
+    # to be in. When the caller cd'd into the skill directory to invoke bin/,
+    # that silently deposits pulled DATA into the skill's own source tree
+    # (once: a 3 MB trace landed in ~/.claude/skills/hpc-tether
+    # and was only noticed when the next command could not find it). Refuse
+    # rather than guess where it should have gone.
+    resolved = dst.resolve()
+    skill_root = Path(__file__).resolve().parent.parent
+    if resolved == skill_root or skill_root in resolved.parents:
+        print(
+            f"hpc-pull: refusing to write into the skill directory "
+            f"({skill_root}).\n"
+            "  Pulled files are data and belong in the working repo, not in "
+            "the tool's source tree.\n"
+            "  Pass an explicit destination: hpc-pull SRC /path/to/repo/name",
+            file=sys.stderr,
+        )
+        return transport.EXIT_USAGE
+
+    if dst.exists() and not args.overwrite:
+        print(
+            f"hpc-pull: {dst} already exists locally. If its edits are "
+            "disposable, pass --overwrite; otherwise move it aside first.",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+
+    try:
+        size, mtime = remote_stat(target, remote_path, timeout=60)
+    except transport.TransportError as exc:
+        print(f"hpc-pull: {exc}", file=sys.stderr)
+        return exc.code
+
+    if size > DEFAULT_MAX_BYTES and not args.force_size:
+        print(
+            f"hpc-pull: {remote_path} is {_human(size)}, above the "
+            f"{_human(DEFAULT_MAX_BYTES)} cap. Pass --force-size to pull it "
+            "anyway, or condense it on the cluster first.",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+
+    why = budget.admit(target, size, add, "pull")
+    if why:
+        print(f"hpc-pull: REFUSED — {why}", file=sys.stderr)
+        return transport.EXIT_GUARD
+
+    rc = scp(target, remote_path, dst, pull=True, timeout=args.timeout)
+    if rc != 0:
+        print(f"hpc-pull: scp failed with exit {rc}", file=sys.stderr)
+        return rc if rc in (transport.EXIT_TIMEOUT,) else transport.EXIT_SSH_FAILURE
+
+    entry = manifest.record(dst, target.name, remote_path, size, mtime)
+    print(
+        f"pulled {target.host}:{remote_path} ({_human(size)}) -> {dst}\n"
+        f"manifest: sha256 {entry['sha256'][:12]}… recorded; hpc-push will "
+        "refuse if the remote changes before you push back.\n"
+        + budget.status_line(budget.session_totals())
+    )
+    return transport.EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
