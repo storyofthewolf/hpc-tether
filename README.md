@@ -8,12 +8,14 @@ SLURM clusters reached over an SSH ControlMaster, and used daily on one.
 The agent acts as you on shared, mostly unbacked-up storage. The toolkit
 steers it: it routes work through fixed tools, refuses the mistakes agents
 commonly make (a deletion, a write outside your directories, a second job of
-the same name), asks you before each write, and logs everything. It is not a
-security boundary, and the last section says what it does not catch.
+the same name), asks you before each write, and logs everything. The last
+section says what it does not catch.
 
 The name says how it works: the agent works on the cluster on a line you
 hold. The profile sets how far it reaches, and each approval prompt is yours
 to give or withhold.
+
+![How hpc-tether works: the agent reaches the cluster only through hpc-tether's fixed tools; hooks ask you before each write and block raw ssh; a payload guard applies the profile you set; every call is logged and shown back to you; commands ride an SSH ControlMaster you open yourself.](docs/hpc-tether-overview.svg)
 
 ## Why tools instead of plain `ssh`
 
@@ -35,9 +37,7 @@ The skill steers the agent to the right tool, the tools carry the connection
 plumbing (the shared master connection, tcsh quoting, remote timeouts), and a
 hook blocks raw `ssh` so the agent can't skip them by forgetting. Together
 they shape a well-meaning agent's work into controlled channels: mistakes get
-caught, consequential actions ask you first, and everything is logged. They
-are not a security boundary. The guard reads text, so a determined agent can
-phrase its way past it.
+caught, consequential actions ask you first, and everything is logged.
 
 ## What you choose: a profile
 
@@ -73,7 +73,7 @@ one, and a refusal tells it to ask you.
 
 ## What it does not promise
 
-- **It is not a security boundary.** The agent runs on your machine, as you,
+- **It catches accidents, not adversaries.** The agent runs on your machine, as you,
   beside an open SSH connection, and a scan of shell text cannot stop a
   payload written to get past it. The guard catches the mistakes agents make
   by habit; the ones it knows it misses are listed under "Known limits" in

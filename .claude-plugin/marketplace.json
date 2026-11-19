@@ -6,7 +6,7 @@
     {
       "name": "hpc-tether",
       "source": "./",
-      "description": "Guarded, audited access to an HPC cluster: profiles, a payload guard, approval prompts, netCDF inspection, a SLURM job monitor."
+      "description": "Guarded, audited access to an HPC cluster: profiles, a payload guard, approval prompts, netCDF inspection, SLURM job checks."
     }
   ]
 }
