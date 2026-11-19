@@ -258,7 +258,7 @@ class TestPluginDirectoryIsNotATool(unittest.TestCase):
         return mod._tokens_used(command)
 
     def test_directory_name_alone_draws_no_prompt(self):
-        for c in ("cd ~/Research/tools/hpc-tether && git push --force",
+        for c in ("cd ~/Tools/hpc-tether && git push --force",
                   "git -C ~/tools/hpc-tether push --force origin main",
                   "brew upgrade --force && ls ~/.config/hpc-tether/",
                   'grep -rn -- --yes "/x/hpc-tether"'):
