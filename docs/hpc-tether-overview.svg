@@ -1,9 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 440" width="960" height="440" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 500" width="960" height="500" role="img" aria-labelledby="t d">
   <title id="t">How hpc-tether works</title>
-  <desc id="d">The agent reaches the cluster only through hpc-tether's fixed tools. A payload guard checks each one against the profile you set, hooks ask you before each write and block raw ssh, and every call is logged and shown back to you. Commands ride an SSH ControlMaster you open yourself.</desc>
+  <desc id="d">In call order: when the agent issues a command, hooks run first, blocking raw ssh, scp and rsync and asking you before each write. The fixed tool then builds the payload, and a payload guard checks it against the profile you set before it goes over the SSH ControlMaster you open yourself, with your 2FA. Every call is logged and shown back to you as a receipt.</desc>
   <style>
     .bg      { fill: #ffffff; }
-    .box     { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.5; }
+    .box     { fill: #f6f8fa; stroke: #8c959f; stroke-width: 2; }
     .tether  { fill: #eef4fb; stroke: #4a7fc1; stroke-width: 2; }
     .inner   { fill: #ffffff; stroke: #a8c3e6; stroke-width: 1.2; }
     .title   { fill: #1f2328; font: 600 15px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
@@ -11,105 +11,106 @@
     .text    { fill: #424a53; font: 13px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
     .small   { fill: #59636e; font: 12px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
     .label   { fill: #59636e; font: italic 12px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
-    .blocked { fill: #c0392b; font: 600 12px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
     .line    { stroke: #6e7781; stroke-width: 1.6; fill: none; }
+    .thin    { stroke: #6e7781; stroke-width: 1.4; fill: none; }
     .flow    { stroke: #4a7fc1; stroke-width: 2.2; fill: none; }
     .tip     { fill: #6e7781; }
     .tipflow { fill: #4a7fc1; }
     @media (prefers-color-scheme: dark) {
       .bg      { fill: #0d1117; }
-      .box     { fill: #161b22; stroke: #3d444d; }
+      .box     { fill: #161b22; stroke: #768390; }
       .tether  { fill: #111c2b; stroke: #5b93d6; }
       .inner   { fill: #0d1117; stroke: #2f4d72; }
       .title   { fill: #e6edf3; }
       .head    { fill: #8cb8ec; }
       .text    { fill: #c9d1d9; }
       .small, .label { fill: #9198a1; }
-      .blocked { fill: #f07167; }
-      .line    { stroke: #8b949e; }
+      .line, .thin { stroke: #8b949e; }
       .tip     { fill: #8b949e; }
       .flow    { stroke: #5b93d6; }
       .tipflow { fill: #5b93d6; }
     }
   </style>
   <defs>
-    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <!-- Fixed-size heads (user units), so gray and blue arrows match -->
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
       <path class="tip" d="M0,0 L10,5 L0,10 z"/>
     </marker>
-    <marker id="af" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <marker id="af" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
       <path class="tipflow" d="M0,0 L10,5 L0,10 z"/>
     </marker>
   </defs>
 
-  <rect class="bg" x="0" y="0" width="960" height="440" rx="12"/>
-
-  <!-- You -->
-  <rect class="box" x="20" y="40" width="160" height="160" rx="10"/>
-  <text class="title" x="36" y="68">You</text>
-  <text class="text" x="36" y="94">set the profile</text>
-  <text class="text" x="36" y="114">approve each write</text>
-  <text class="text" x="36" y="134">read the receipts</text>
-  <text class="text" x="36" y="154">open the connection</text>
-  <text class="small" x="36" y="182">(only you can)</text>
+  <rect class="bg" x="0" y="0" width="960" height="500" rx="12"/>
 
   <!-- Agent -->
-  <rect class="box" x="20" y="250" width="160" height="110" rx="10"/>
-  <text class="title" x="36" y="278">Claude Code agent</text>
-  <text class="text" x="36" y="304">works on the cluster</text>
-  <text class="text" x="36" y="324">for you, through</text>
-  <text class="text" x="36" y="344">hpc-tether only</text>
+  <rect class="box" x="20" y="60" width="160" height="110" rx="10"/>
+  <text class="title" x="36" y="88">Claude Code agent</text>
+  <text class="text" x="36" y="114">works on the cluster</text>
+  <text class="text" x="36" y="134">for you, through</text>
+  <text class="text" x="36" y="154">hpc-tether only</text>
 
-  <!-- hpc-tether -->
+  <!-- You -->
+  <rect class="box" x="20" y="280" width="160" height="160" rx="10"/>
+  <text class="title" x="36" y="308">You</text>
+  <text class="text" x="36" y="334">set the profile</text>
+  <text class="text" x="36" y="354">approve each write</text>
+  <text class="text" x="36" y="374">read the receipts</text>
+  <text class="text" x="36" y="394">open the connection</text>
+  <text class="small" x="36" y="422">(only you can)</text>
+
+  <!-- hpc-tether, in call order -->
   <rect class="tether" x="250" y="24" width="400" height="392" rx="12"/>
   <text class="head" x="270" y="54">hpc-tether</text>
   <text class="small" x="372" y="54">on your machine</text>
 
-  <rect class="inner" x="270" y="70" width="360" height="66" rx="8"/>
-  <text class="title" x="286" y="94">Hooks</text>
-  <text class="text" x="286" y="118">ask you before each write · block raw ssh</text>
+  <rect class="inner" x="270" y="66" width="360" height="62" rx="8"/>
+  <text class="title" x="286" y="90">Hooks</text>
+  <text class="text" x="286" y="112">ask you before each write · block raw ssh</text>
 
-  <rect class="inner" x="270" y="150" width="360" height="66" rx="8"/>
-  <text class="title" x="286" y="174">Audit log</text>
-  <text class="text" x="286" y="198">every payload and transfer, as sent</text>
+  <rect class="inner" x="270" y="154" width="360" height="62" rx="8"/>
+  <text class="title" x="286" y="178">Fixed tools</text>
+  <text class="text" x="286" y="200">hpc-run · hpc-jobs · hpc-read · etc.</text>
 
-  <rect class="inner" x="270" y="246" width="360" height="66" rx="8"/>
-  <text class="title" x="286" y="270">Fixed tools</text>
-  <text class="text" x="286" y="294">hpc-run · hpc-jobs · hpc-read · hpc-pull · …</text>
+  <rect class="inner" x="270" y="242" width="360" height="62" rx="8"/>
+  <text class="title" x="286" y="266">Payload guard</text>
+  <text class="text" x="286" y="288">profile: observe → prepare → operate → improvise</text>
 
-  <rect class="inner" x="270" y="330" width="360" height="70" rx="8"/>
-  <text class="title" x="286" y="354">Payload guard</text>
-  <text class="text" x="286" y="378">profile: observe → prepare → operate → improvise</text>
+  <rect class="inner" x="270" y="330" width="360" height="62" rx="8"/>
+  <text class="title" x="286" y="354">Audit log</text>
+  <text class="text" x="286" y="376">every payload and transfer, as sent</text>
 
-  <!-- inside flows -->
-  <line class="line" x1="450" y1="246" x2="450" y2="220" marker-end="url(#a)"/>
-  <text class="label" x="458" y="236">logged</text>
-  <line class="flow" x1="350" y1="312" x2="350" y2="326" marker-end="url(#af)"/>
+  <!-- the call path down the stack -->
+  <line class="flow" x1="350" y1="130" x2="350" y2="152" marker-end="url(#af)"/>
+  <line class="flow" x1="350" y1="218" x2="350" y2="240" marker-end="url(#af)"/>
+  <line class="line" x1="350" y1="306" x2="350" y2="328" marker-end="url(#a)"/>
+  <text class="label" x="360" y="322">logged</text>
 
-  <!-- You <- hooks, audit -->
-  <line class="line" x1="270" y1="110" x2="184" y2="110" marker-end="url(#a)"/>
-  <text class="label" x="192" y="102">prompt</text>
-  <line class="line" x1="270" y1="182" x2="184" y2="182" marker-end="url(#a)"/>
-  <text class="label" x="190" y="174">receipts</text>
+  <!-- agent -> Hooks -->
+  <line class="flow" x1="180" y1="97" x2="268" y2="97" marker-end="url(#af)"/>
 
-  <!-- agent -> tools -->
-  <line class="flow" x1="180" y1="279" x2="266" y2="279" marker-end="url(#af)"/>
-  <!-- raw ssh blocked -->
-  <text class="blocked" x="36" y="388">raw ssh / scp / rsync → BLOCKED</text>
+  <!-- Hooks -> You (down the left gap), Audit log -> You -->
+  <path class="line" d="M270,116 L222,116 L222,300 L182,300" marker-end="url(#a)"/>
+  <text class="label" x="217" y="222" text-anchor="end">prompt</text>
+  <line class="line" x1="270" y1="361" x2="182" y2="361" marker-end="url(#a)"/>
+  <text class="label" x="190" y="353">receipts</text>
 
-  <!-- guard -> ControlMaster -> cluster -->
-  <line class="flow" x1="630" y1="365" x2="676" y2="365" marker-end="url(#af)"/>
-  <rect class="box" x="680" y="310" width="138" height="100" rx="10"/>
-  <text class="title" x="696" y="336">SSH</text>
-  <text class="title" x="696" y="356">ControlMaster</text>
-  <text class="small" x="696" y="380">you open it,</text>
-  <text class="small" x="696" y="396">with your 2FA</text>
+  <!-- Guard -> ControlMaster -> Cluster -->
+  <line class="flow" x1="630" y1="273" x2="678" y2="273" marker-end="url(#af)"/>
+  <rect class="box" x="680" y="233" width="138" height="80" rx="10"/>
+  <text class="title" x="696" y="267">SSH</text>
+  <text class="title" x="696" y="287">ControlMaster</text>
 
-  <line class="flow" x1="818" y1="360" x2="836" y2="360" marker-end="url(#af)"/>
-  <rect class="box" x="840" y="290" width="104" height="120" rx="10"/>
-  <text class="title" x="854" y="318">Cluster</text>
-  <text class="small" x="854" y="342">SLURM</text>
-  <text class="small" x="854" y="360">scratch</text>
-  <text class="small" x="854" y="378">your repos</text>
+  <line class="flow" x1="818" y1="273" x2="838" y2="273" marker-end="url(#af)"/>
+  <rect class="box" x="840" y="221" width="104" height="104" rx="10"/>
+  <text class="title" x="854" y="249">Cluster</text>
+  <text class="small" x="854" y="273">SLURM</text>
+  <text class="small" x="854" y="291">scratch</text>
+  <text class="small" x="854" y="309">your repos</text>
+
+  <!-- You open the connection: under the hpc-tether box, up the gap -->
+  <path class="thin" d="M100,440 L100,470 L656,470 L656,298 L678,298" marker-end="url(#a)"/>
+  <text class="label" x="380" y="462">you open it, with 2FA</text>
 
   <!-- note -->
   <text class="title" x="690" y="70">Steering, with a safety net</text>
