@@ -147,6 +147,9 @@ class TestPrebuiltIsReadTier(unittest.TestCase):
             "cd ~/my-tools && python my-script.py check A",
             "cd ~ && python my-tools/my-script.py check A",
             'echo "$HOME"\ncd ~/my-tools && python my-script.py check A',
+            "cd $HPC_REPO && echo yes | python my-script.py make A",
+            "cd $HPC_REPO && printf 'y\\n' | python my-script.py make A | tail -5",
+            "cd $HPC_REPO && python my-script.py check A | grep x",
         ):
             with self.subTest(script=script):
                 self.assertEqual(kinds(script), [])
@@ -212,6 +215,13 @@ class TestHandRolledStaysStrict(unittest.TestCase):
             "cd /scratch/tester && python my-script.py check A",
             "cd() { :; }\ncd $HPC_REPO && python my-script.py check A",
             "echo $(cd $HPC_REPO && python my-script.py check A)",
+            # the pipeline after the cd resolves; past it, nothing does
+            "cd $HPC_REPO && echo yes | ls && python my-script.py check A",
+            "cd $HPC_REPO && echo yes; echo | python my-script.py check A",
+            "cd $HPC_REPO && echo yes || echo | python my-script.py check A",
+            "cd $HPC_REPO && echo yes & echo | python my-script.py check A",
+            "echo | cd $HPC_REPO && echo | python my-script.py check A",
+            "cd $HPC_REPO && echo yes |& python my-script.py check A",
         ):
             with self.subTest(script=script):
                 self.assertIn(guard.INTERPRETER, kinds(script))

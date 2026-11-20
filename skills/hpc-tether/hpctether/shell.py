@@ -166,11 +166,16 @@ def cd_dirs(
 ) -> list[str | None]:
     """For each segment, the directory a relative trusted path resolves in.
 
-    Only a segment IMMEDIATELY preceded by ``cd <dir> &&`` gets one. ``&&`` is
+    Only the pipeline IMMEDIATELY after ``cd <dir> &&`` gets one. ``&&`` is
     the whole point: if the ``cd`` fails the command never runs, so it cannot
     run from some other directory where the same relative name is a different
-    file. ``;``, ``||``, a pipe, a background ``&``, or any command in between
-    leaves the directory unknown and the invocation at interpreter tier.
+    file. ``|`` binds tighter than ``&&``, so ``cd X && echo yes | python f.py``
+    is ``cd X && (echo yes | python f.py)``: every stage runs only after the
+    ``cd`` succeeded, each in a subshell started in X, and no stage can move
+    another. So every stage of that pipeline gets the directory. ``;``,
+    ``||``, a background ``&``, or another command chained with ``&&`` in
+    between (a ``source`` or ``eval`` there could ``cd``) leaves the directory
+    unknown and the invocation at interpreter tier.
 
     The ``cd`` must itself run unconditionally in the current shell: first on
     the line, or after ``;`` or ``&&``. After ``||`` it is skipped whenever the
@@ -185,6 +190,10 @@ def cd_dirs(
         before_cd = pairs[k - 2][1] if k >= 2 else ""
         if prev_op == "&&" and before_cd in ("", ";", "&&"):
             out[k] = cd_target(prev_seg.strip(), paths, home)
+        elif prev_op == "|" and k >= 2 and out[k - 1] is not None:
+            # A later stage of the pipeline that follows the cd. `|&` splits
+            # as `|` then an empty segment ending in `&`, so it never gets here.
+            out[k] = out[k - 1]
     return out
 
 
