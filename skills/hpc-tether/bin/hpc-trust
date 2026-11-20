@@ -47,9 +47,11 @@ def cmd_list(args, target) -> int:
              else "INACTIVE: profile is below operate")
     print(f"profile: {target.profile} ({profile_mod.SUMMARY[target.profile]})")
     print(f"trusted repos (script roots) for {target.name!r} ({target.source}), {state}:")
+    no_preview = {r.remote for r in target.repos.values() if not r.preview}
     for root in target.script_roots or ["(none declared)"]:
         scoped = target.root_confirm.get(root, ())
-        print(f"  {root}" + (f"   confirm: {', '.join(scoped)}" if scoped else ""))
+        print(f"  {root}" + (f"   confirm: {', '.join(scoped)}" if scoped else "")
+              + ("   preview: off" if scoped and root in no_preview else ""))
     if target.script_confirm:
         print("confirm patterns for every root (still need --allow-write):")
         for pattern in target.script_confirm:

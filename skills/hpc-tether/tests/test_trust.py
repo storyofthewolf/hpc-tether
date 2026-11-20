@@ -339,6 +339,17 @@ class TestHpcTrust(unittest.TestCase):
         self.assertIn("my-tools: /l/my-tools  <->  /home/tester/py/my-tools", out)
         self.assertNotIn("far:", out)
 
+    def test_list_shows_preview_off(self):
+        toml = SITE_TOML + ('\n[repos.gated]\nremote = "/home/tester/py/gated"\n'
+                            'trusted = true\nconfirm = ["* --execute*"]\npreview = false\n'
+                            '\n[repos.plain]\nremote = "/home/tester/py/plain"\n'
+                            'trusted = true\nconfirm = ["* --go*"]\n')
+        with TempSites(toml):
+            code, out, _ = _run(self.mod, ["--site", "testsite", "list"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("/home/tester/py/gated   confirm: * --execute*   preview: off", out)
+        self.assertIn("/home/tester/py/plain   confirm: * --go*\n", out)
+
     def test_check_reports_tiers(self):
         with TempSites():
             code, out, _ = _run(self.mod, ["--site", "testsite", "check", "-"],

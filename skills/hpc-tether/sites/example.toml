@@ -72,6 +72,9 @@ output  = "/projects/yourgroup/yourusername/output"
 #            it, so a script that deletes will delete.
 #   confirm  patterns over "<path in repo> <args>" that still need your
 #            approval, e.g. ["*submit.py *--execute*"]. This repo only.
+#   preview  false: the agent sends a confirm match without first running
+#            it without the action flag and showing you the preview
+#            (default true). See reference/trusted-scripts.md.
 #   role     also name the checkout as a common path ("repo" -> $HPC_REPO).
 #
 # [repos.mymodel]

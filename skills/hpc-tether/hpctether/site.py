@@ -29,7 +29,8 @@ _KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 #: How a mirrored checkout may change on the cluster (see :class:`Repo`).
 REPO_MODES = ("pull-only", "two-way")
-_REPO_KEYS = frozenset({"local", "remote", "branch", "mode", "trusted", "role", "confirm"})
+_REPO_KEYS = frozenset({"local", "remote", "branch", "mode", "trusted", "role", "confirm",
+                        "preview"})
 _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -66,6 +67,10 @@ class Repo:
     #: fnmatch patterns over ``<path in repo> <args>`` that still need
     #: --allow-write; they apply to this repo's scripts only.
     confirm: tuple[str, ...] = ()
+    #: Whether the agent previews a ``confirm`` match (runs it without the
+    #: action flag and shows the result) before sending it. Advisory: the
+    #: skill reads it from ``hpc-trust list``; the guard does not enforce it.
+    preview: bool = True
 
 
 @dataclass(frozen=True)
@@ -498,6 +503,12 @@ def _load_repos(table, path: Path) -> dict[str, Repo]:
         if confirm and not trusted:
             raise SiteError(f"{where}: confirm applies only to a trusted repo "
                             "(an untrusted repo's scripts already need a token)")
+        preview = entry.get("preview", True)
+        if not isinstance(preview, bool):
+            raise SiteError(f"{where}: preview must be true or false")
+        if "preview" in entry and not trusted:
+            raise SiteError(f"{where}: preview applies only to a trusted repo "
+                            "(it governs previewing its confirm matches)")
         repos[name] = Repo(
             name=name,
             local=str(Path(local.strip()).expanduser()) if local else None,
@@ -507,6 +518,7 @@ def _load_repos(table, path: Path) -> dict[str, Repo]:
             trusted=trusted,
             role=role,
             confirm=tuple(confirm),
+            preview=preview,
         )
     remotes = sorted((r.remote, r.name) for r in repos.values())
     for (a, an), (b, bn) in zip(remotes, remotes[1:]):

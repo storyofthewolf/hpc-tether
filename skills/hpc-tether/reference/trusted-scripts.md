@@ -39,11 +39,13 @@ The guard recognizes a trusted script only by a path it can name for certain:
 - a site role: `python $HPC_REPO/my-script.py check CASE`
 - `~/`, when the site declares a `home` path role:
   `python ~/code/analysis/plot.py`
-- relative, directly after `cd <absolute, role or ~> &&` on the same line:
-  `cd ~/code/analysis && python summarize.py`
+- relative, in the pipeline directly after `cd <absolute, role or ~> &&` on
+  the same line: `cd ~/code/analysis && python summarize.py`, or
+  `cd ~/code/analysis && python summarize.py | tail`
 
 `~user`, `$HOME` or any other variable, a glob, a `..`, a `cd` joined by `;`
-or on its own line, or anything between the `cd` and the script leaves it
+or on its own line, or another `&&`, `;`, `||` or `&` between the `cd` and
+the script leaves it
 unrecognized, and so treated as inline code. So does `~` in a payload that
 assigns `HOME`. `python -c`, `python -m`, `python - <<EOF`, a nested `bash -c`
 and a `.py` outside every root are always inline code, including one written
@@ -75,6 +77,50 @@ run unreviewed code with no token:
    only from your own templates. The clean-checkout check trusts ignored
    paths for exactly this reason.
 
+## Gating consequential scripts (optional)
+
+Most trusted repos need no gate. An analysis or plotting script reads model
+output and writes figures or tables into scratch: let it run. Add a gate
+only to a script whose actions are expensive or hard to undo, such as
+submitting jobs, rebuilding or deleting cases, or editing a run in place.
+When you do, design it so the gate is something hpc-tether can see:
+
+1. **Name every action in the command line.** With no action flag, the
+   script previews (reports what it would do) and changes nothing. One
+   flag acts. A `confirm` pattern matches command text, so an action
+   switched on by a config file, a matrix value or an environment variable
+   (`submit: true` in a YAML file) passes every pattern unseen.
+2. **Don't ask at run time.** No `input()` for a decision. Under `hpc-run`
+   the script's stdin is `/dev/null`: a prompt either stops it or teaches
+   the agent to pipe `yes` into it, and neither one protects anything. The
+   flag is the confirmation. If a prompt stays, end-of-file must mean no.
+3. **Behave the same for every caller.** Don't branch on whether stdin is a
+   terminal, on environment variables, or on who is calling. You approve a
+   command, and that approval means something only if the command does the
+   same thing whoever sends it.
+4. **Use one flag per kind of risk, with the same names in every repo.**
+   `--execute` changes things. A separate flag (such as `--send-it`) covers
+   what spends allocation or can't be undone, so it can be gated on its
+   own. Shared names keep each repo's `confirm` list to the same
+   one or two patterns: `confirm = ["* --execute*", "* --send-it*"]`.
+5. **Make flags exact.** Python's argparse accepts `--exec` for `--execute`
+   unless the parser sets `allow_abbrev=False`, and a pattern would miss
+   it. Set that on every parser and subparser, and give action flags no
+   short aliases (`-x`).
+6. **Make the preview faithful.** It is read-only, cheap, and lists exactly
+   what the action would touch, because it is what your approval rests on.
+   When a selection can change between the preview and the action (a prefix
+   or glob), an `--expect N` that makes the action refuse unless N items
+   match ties the two together.
+7. **Fail loudly.** A refused or partial action exits nonzero with a
+   one-line reason. A preview with nothing to do exits 0.
+
+The agent's side of this: before sending a confirm match, it runs the same
+command without the action flag and shows you the preview. Then it sends the
+real command, which you approve. Set `preview = false` in a repo's entry to
+skip that step for the repo (`hpc-trust list` shows `preview: off`), or say so
+in the session.
+
 ## What stays open
 
 - **Git is the review, and the toolkit can't check that you reviewed.** If an
@@ -87,10 +133,9 @@ run unreviewed code with no token:
 - **A script that breaks the rules above.** Until it's fixed, a `confirm`
   pattern in its repo's entry puts the risky form behind a prompt, for
   example `confirm = ["*build.py *make*"]`.
-- **A script whose flags can be abbreviated.** Python's argparse accepts
-  `--exec` for `--execute` unless the parser sets `allow_abbrev=False`, and
-  a `confirm` pattern matches text. Give a repo `allow_abbrev=False` before
-  writing a `confirm` pattern for one of its flags.
+- **A script whose flags can be abbreviated.** A `confirm` pattern for one
+  of its flags misses the short spellings until the parser sets
+  `allow_abbrev=False` (point 5 under "Gating consequential scripts").
 
 `bin/hpc-trust list` shows the roots and whether they are active at the
 site's profile; `... | bin/hpc-trust check -` shows how a payload classifies.

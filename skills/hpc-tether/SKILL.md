@@ -151,7 +151,12 @@ cannot authorize writes in advance. Read-only requests need no asking.
 A `.py` in a repo the site marks `trusted = true` (`[repos.<name>]`; these
 are the script roots) runs with no token from `operate` up, whatever its
 arguments. A match for that repo's `confirm` patterns needs
-`--allow-write`. It is recognized only when its path is spelled one of the
+`--allow-write`. **Preview a confirm match first:** run the same command
+without the flag that makes it match (`--execute`, `--send-it`), show the user
+what it would act on, then send the real one. Skip the preview for a repo
+that `hpc-trust list` shows with `preview: off`, or when the user says to.
+**Never pipe an answer (`echo yes |`) into a script's own prompt**: if a
+script stops to ask, tell the user. It is recognized only when its path is spelled one of the
 ways in `reference/trusted-scripts.md`; check with `hpc-trust check -`. Code
 reaches a root only through `git pull`, and each root must be a clean git
 checkout or nothing runs (exit 78); a symlink as the script, or an untracked

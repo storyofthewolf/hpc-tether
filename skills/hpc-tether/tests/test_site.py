@@ -86,6 +86,8 @@ def test_no_repos_is_empty(monkeypatch, tmp_path):
     'x = { remote = "/proj/u/x", trusted = "yes" }',
     'x = { remote = "/proj/u/x", confirm = ["* --go*"] }',          # confirm, untrusted
     'x = { remote = "/proj/u/x", role = "my-repo" }',
+    'x = { remote = "/proj/u/x", trusted = true, preview = "no" }',
+    'x = { remote = "/proj/u/x", preview = false }',                 # preview, untrusted
 
     'x = "/proj/u/x"',
 ])
@@ -126,6 +128,7 @@ local = "~/code/my-tools"
 trusted = true
 role = "repo"
 confirm = ["* --execute*"]
+preview = false
 
 [repos.trend]
 remote = "/home/u/py/trend"
@@ -163,6 +166,8 @@ def test_new_layout_loads(monkeypatch, tmp_path):
     assert s.script_confirm == []
     assert s.root_confirm == {"/home/u/py/my-tools": ("* --execute*",)}
     assert s.repos["trend"].local is None
+    # preview defaults on; a repo turns it off for its confirm matches
+    assert s.repos["my-tools"].preview is False and s.repos["trend"].preview is True
     assert s.warnings == ()
 
 
