@@ -61,11 +61,11 @@ inside the sandbox.
 
 ### Sandbox and unattended sessions (optional)
 
-- **`[sandbox] root`** in your site file names one directory where what your
-  profile already allows runs without asking: writes and pushes into it,
-  jobs whose script is in it, code run from it, and actions of your trusted
-  scripts that confine themselves to it (`scope_option`). It never raises
-  the profile. Everything outside asks as before. See
+- **`sandbox_roots`** under `[policy]` in your site file names directories
+  where what your profile already allows runs without asking: writes and
+  pushes into them, jobs whose script is in one, code run from one. It
+  never raises the profile, and your trusted scripts' `confirm` patterns
+  still ask. Everything outside asks as before. See
   `reference/design.md`, "The sandbox".
 - **`/hpc-tether:unattended on [HH:MM]`** switches one session to refuse
   instead of asking, so a run left overnight never waits on a prompt. Work

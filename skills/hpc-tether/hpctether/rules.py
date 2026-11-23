@@ -86,11 +86,11 @@ class Violation:
     #: can be undone", and "The sandbox").
     token: bool = True
     #: False where the sandbox never waives the token: a git push, job
-    #: control other than sbatch, an always_confirm match.
+    #: control other than sbatch, a trusted script's confirm match.
     sandboxable: bool = True
     #: For a construct whose target is not a plain file write -- an sbatch
-    #: script, a trusted script's scope directory, an interpreter's working
-    #: directory -- whether that target lies inside the roots this scan was
+    #: script, an interpreter's working directory -- whether that target
+    #: lies inside the roots this scan was
     #: given. None: decided by the kind (a write that was not refused).
     in_roots: "bool | None" = None
 
@@ -296,13 +296,12 @@ def trusted_script(c: Command):
         c.uses.append(use)
     if use.tier == "free":
         return []
-    scoped = bool(use.scope_dir) and not use.always and c.ctx is not None
-    in_roots = scoped and confine.check_path(use.scope_dir, c.ctx, "scope") is None
+    # The guard can't see where a trusted script writes, so the sandbox
+    # never waives a confirm match: the user asked to be asked.
     return [c.v(WRITE,
                 f"pre-built script {use.path} with arguments {use.args!r} matches "
                 "a script_confirm pattern in the site file — needs --allow-write "
-                "and per-use user confirmation",
-                sandboxable=scoped, in_roots=in_roots)]
+                "and per-use user confirmation", sandboxable=False)]
 
 
 #: Interpreter flags that take a glued argument, so the letters after them

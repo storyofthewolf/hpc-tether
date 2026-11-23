@@ -187,7 +187,7 @@ def classify(
     script_roots: "list[str] | None" = None,
     repos=None,
     protected: "list[str] | None" = None,
-    sandbox: "str | None" = None,
+    sandbox: "list[str] | None" = None,
 ) -> Report:
     """Classify every command in ``script``.
 
@@ -212,11 +212,11 @@ def classify(
             role-spelled ``cd`` is resolved at all.
         protected: ``[policy] protected``: directories never written, even
             inside a write root.
-        sandbox: ``[sandbox] root``, or None. The payload is classified a
-            second time with the sandbox as its only write root; a write,
-            sbatch, scoped trusted-script action or interpreter call that
-            stays inside it loses its token (``Violation.token`` False). It
-            never changes a kind, so the profile's verdict is untouched.
+        sandbox: ``[policy] sandbox_roots``, or None. The payload is
+            classified a second time with these as its only write roots; a
+            write, sbatch or interpreter call that stays inside them loses
+            its token (``Violation.token`` False). It never changes a kind,
+            so the profile's verdict is untouched.
         repos: the site's ``[repos]`` (name -> :class:`hpctether.site.Repo`).
             A git write in a listed checkout follows that entry's mode
             instead of the write roots (see ``rules._repo_sync_refusal``).
@@ -229,7 +229,7 @@ def classify(
     if not sandbox or not any(v.kind in (WRITE, INTERPRETER, UNKNOWN)
                               for v in report.violations):
         return report
-    inside = _classify(script, [sandbox], None, trust, paths, aliases,
+    inside = _classify(script, list(sandbox), None, trust, paths, aliases,
                        script_roots, None, protected)
     return _waive_inside(report, inside)
 

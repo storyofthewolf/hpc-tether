@@ -1,7 +1,7 @@
 """The sandbox: a directory where what the profile allows needs no token.
 
 It never widens a profile and never changes a kind: a write is still write
-tier, code is still interpreter tier. Inside ``[sandbox] root`` the token is
+tier, code is still interpreter tier. Inside the sandbox roots the token is
 dropped (``Violation.token`` False), so nothing asks; outside, everything
 asks as before. Plus the per-session ``unattended`` switch.
 """
@@ -25,13 +25,12 @@ PATHS = {"scratch": "/scratch/tester", "home": "/home/tester", "sandbox": SB,
 TOOL = "/home/tester/tool"
 ROOTS = trust.Roots(
     roots=(TOOL,),
-    scoped=((TOOL, ("* --execute*", "* --purge*")),),
+    scoped=((TOOL, ("* --execute*",)),),
     paths=tuple(sorted(PATHS.items())),
-    scope=((TOOL, ("--within", ("* --purge*",))),),
 )
 
 
-def tokens(script, sandbox=SB):
+def tokens(script, sandbox=(SB,)):
     r = guard.classify(script + "\n", roots=["/scratch/tester"], paths=PATHS,
                        trust=ROOTS, repos={}, sandbox=sandbox)
     return [(v.kind, v.token) for v in r.violations]
@@ -68,17 +67,16 @@ class TestGuardWaiver(unittest.TestCase):
         self.assertEqual(tokens("python $HPC_SANDBOX/x/foo.py"), [("interpreter", True)])
         self.assertEqual(tokens("cd $HPC_SCRATCH && python foo.py"), [("interpreter", True)])
 
-    def test_trusted_script_scope_option(self):
-        run = "python $HPC_REPO/build.py make x --execute"
-        self.assertEqual(tokens(run), [("write", True)])
-        self.assertEqual(tokens(run + " --within $HPC_SANDBOX/d"), [("write", False)])
-        self.assertEqual(tokens(run + " --within=$HPC_SANDBOX/d"), [("write", False)])
-        self.assertEqual(tokens(run + " --within $HPC_SCRATCH/prod"), [("write", True)])
+    def test_trusted_confirm_match_keeps_its_token(self):
+        # The guard can't see where a trusted script writes; the user's
+        # confirm pattern asks, sandbox or not.
+        self.assertEqual(tokens("cd $HPC_SANDBOX && python $HPC_REPO/build.py make x --execute"),
+                         [("write", True)])
 
-    def test_always_confirm_beats_scope(self):
-        self.assertEqual(
-            tokens("python $HPC_REPO/datamgr.py retire x --purge --within $HPC_SANDBOX/d"),
-            [("write", True)])
+    def test_several_roots(self):
+        two = (SB, "/scratch/tester/other-sb")
+        self.assertEqual(tokens("mkdir -p /scratch/tester/other-sb/x", sandbox=two),
+                         [("write", False)])
 
     def test_git(self):
         self.assertEqual(tokens("git clone https://e.org/x.git $HPC_SANDBOX/src/x"),
@@ -87,12 +85,12 @@ class TestGuardWaiver(unittest.TestCase):
 
     def test_forbidden_stays_forbidden(self):
         r = guard.classify("rm -rf $HPC_SANDBOX/x\n", roots=["/scratch/tester"],
-                           paths=PATHS, repos={}, sandbox=SB)
+                           paths=PATHS, repos={}, sandbox=[SB])
         self.assertEqual(r.worst(), guard.FORBIDDEN)
 
     def test_the_role_cannot_be_moved(self):
         r = guard.classify("HPC_SANDBOX=/home/tester; mkdir $HPC_SANDBOX/x\n",
-                           roots=["/scratch/tester"], paths=PATHS, repos={}, sandbox=SB)
+                           roots=["/scratch/tester"], paths=PATHS, repos={}, sandbox=[SB])
         self.assertEqual(r.worst(), guard.FORBIDDEN)
 
 
@@ -101,13 +99,13 @@ name = "testsite"
 host = "test.example.edu"
 scheduler = "slurm"
 user = "tester"
+
+[policy]
 profile = "{profile}"
+sandbox_roots = ["/scratch/tester/sandbox"]
 
 [paths]
 scratch = "/scratch/tester"
-
-[sandbox]
-root = "/scratch/tester/sandbox"
 """
 
 
@@ -118,7 +116,7 @@ class TestSiteFile(unittest.TestCase):
 
     def test_root_and_role(self):
         s = self.load(SANDBOX_TOML.format(profile="prepare"))
-        self.assertEqual(s.sandbox, SB)
+        self.assertEqual(s.sandbox_roots, [SB])
         self.assertEqual(s.env()["HPC_SANDBOX"], SB)
         self.assertEqual(s.remote_path("sandbox:a/b"), SB + "/a/b")
 
@@ -129,24 +127,22 @@ class TestSiteFile(unittest.TestCase):
 
     def test_must_clear_protected(self):
         bad = SANDBOX_TOML.format(profile="prepare").replace(
-            'profile = "prepare"\n',
-            'profile = "prepare"\n[policy]\nprotected = ["/scratch/tester/sandbox/keep"]\n')
-        # [policy] table must precede the others in TOML; rebuild cleanly.
-        bad = ('name = "testsite"\nhost = "h"\nscheduler = "slurm"\nuser = "tester"\n'
-               '[policy]\nprofile = "prepare"\nprotected = ["/scratch/tester/sandbox/keep"]\n'
-               '[paths]\nscratch = "/scratch/tester"\n[sandbox]\nroot = "' + SB + '"\n')
+            'sandbox_roots', 'protected = ["/scratch/tester/sandbox/keep"]\nsandbox_roots')
         with self.assertRaisesRegex(site_mod.SiteError, "overlaps protected"):
             self.load(bad)
 
-    def test_unknown_key(self):
-        with self.assertRaisesRegex(site_mod.SiteError, "unknown key"):
-            self.load(SANDBOX_TOML.format(profile="prepare") + "roots = []\n")
+    def test_several_roots_name_no_role(self):
+        two = SANDBOX_TOML.format(profile="prepare").replace(
+            '["/scratch/tester/sandbox"]', '["/scratch/tester/sandbox", "/scratch/tester/sb2"]')
+        s = self.load(two)
+        self.assertEqual(len(s.sandbox_roots), 2)
+        self.assertNotIn("sandbox", s.paths)
 
-    def test_scope_keys_need_a_trusted_repo(self):
-        text = SANDBOX_TOML.format(profile="operate") + (
-            '\n[repos.tool]\nremote = "/home/tester/tool"\nscope_option = "--within"\n')
-        with self.assertRaisesRegex(site_mod.SiteError, "trusted"):
-            self.load(text)
+    def test_not_a_list(self):
+        bad = SANDBOX_TOML.format(profile="prepare").replace(
+            '["/scratch/tester/sandbox"]', '"/scratch/tester/sandbox"')
+        with self.assertRaisesRegex(site_mod.SiteError, "list of strings"):
+            self.load(bad)
 
 
 class TestHpcRun(unittest.TestCase):

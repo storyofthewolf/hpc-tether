@@ -7,7 +7,7 @@
 
 Unattended, the approval hook denies every token instead of asking, so a
 session left overnight never waits on a prompt nobody will answer. Reads,
-and what the profile allows inside ``[sandbox] root``, need no token and go
+and what the profile allows inside the sandbox roots, need no token and go
 on. The switch is per session and grants nothing (reference/design.md,
 "Unattended sessions"). The user switches it with /hpc-tether:unattended.
 

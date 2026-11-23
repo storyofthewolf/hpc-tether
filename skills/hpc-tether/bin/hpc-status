@@ -127,8 +127,8 @@ def site_lines() -> list[str]:
         except transport.TransportError as exc:
             conn = f"connection unknown: {exc}"
         out.append(f"{name}: profile {target.profile} ({profile_mod.SUMMARY[target.profile]}) · {conn}")
-        if target.sandbox:
-            out.append(f"{name}: sandbox {target.sandbox} (what the profile allows "
+        for root in target.sandbox_roots:
+            out.append(f"{name}: sandbox {root} (what the profile allows "
                        "runs there with no token)")
     return out
 

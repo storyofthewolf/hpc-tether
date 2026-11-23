@@ -90,20 +90,18 @@ inside the sandbox.
 
 ## The sandbox and unattended sessions
 
-If the site sets `[sandbox] root` (`$HPC_SANDBOX`, `sandbox:` in tool
-paths; `hpc-trust list` shows it), what the profile already allows needs
-**no token** there. Send these without one; a token makes the hook ask
+If the site sets `[policy] sandbox_roots` (`hpc-trust list` shows them; a
+single one is `$HPC_SANDBOX`, `sandbox:` in tool paths), what the profile
+already allows needs **no token** inside them. Send these without one; a token makes the hook ask
 anyway:
 
 - writes and `hpc-push` whose every target is inside (push makes the
   missing directory);
 - `sbatch` of a job script inside;
-- code run after `cd $HPC_SANDBOX/... &&` (improvise);
-- a trusted script's `confirm` match that carries its repo's scope option
-  (`hpc-trust list`, `scope:`) with a directory inside.
+- code run after `cd $HPC_SANDBOX/... &&` (improvise).
 
 The sandbox never raises the level and never waives `git push`, job control
-by id, or a repo's `always_confirm`. Put work there when the user or the
+by id, or a trusted script's `confirm` match. Put work there when the user or the
 project's own rules say it belongs there (trials, debugging, benchmarks,
 scratch inputs, dev clones); everything outside asks as before.
 

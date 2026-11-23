@@ -30,7 +30,7 @@ _KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 #: How a mirrored checkout may change on the cluster (see :class:`Repo`).
 REPO_MODES = ("pull-only", "two-way")
 _REPO_KEYS = frozenset({"local", "remote", "branch", "mode", "trusted", "role", "confirm",
-                        "preview", "scope_option", "always_confirm"})
+                        "preview"})
 _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -71,14 +71,6 @@ class Repo:
     #: action flag and shows the result) before sending it. Advisory: the
     #: skill reads it from ``hpc-trust list``; the guard does not enforce it.
     preview: bool = True
-    #: The option with which this repo's scripts confine themselves to one
-    #: directory (``--within``). A ``confirm`` match carrying it with a
-    #: directory inside the sandbox needs no token: the script is trusted to
-    #: honour its own option, as a trusted script is trusted at all.
-    scope_option: str | None = None
-    #: Patterns that always need a token, scope or not (``* --purge*``).
-    #: They count as ``confirm`` patterns too.
-    always_confirm: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -114,10 +106,10 @@ class Site:
     #: Notes for the user about the file itself (old key names); printed by
     #: hpc-check. Never affects what is allowed.
     warnings: tuple[str, ...] = ()
-    #: ``[sandbox] root``: a directory, inside the write roots, where what
-    #: the profile allows runs with no token (design.md, "The sandbox").
-    #: Also the path role ``sandbox`` ($HPC_SANDBOX). None: no sandbox.
-    sandbox: str | None = None
+    #: ``[policy] sandbox_roots``: directories, inside the write roots, where
+    #: what the profile allows runs with no token (design.md, "The sandbox").
+    #: A single one is also the path role ``sandbox`` ($HPC_SANDBOX).
+    sandbox_roots: list[str] = field(default_factory=list)
 
     def allows(self, level: str) -> bool:
         """True if this site's profile permits what ``level`` requires."""
@@ -410,13 +402,15 @@ def load(name: str | None = None) -> Site:
         if repo.trusted:
             if repo.remote not in roots:
                 roots.append(repo.remote)
-            if repo.confirm or repo.always_confirm:
-                root_confirm[repo.remote] = repo.confirm + repo.always_confirm
+            if repo.confirm:
+                root_confirm[repo.remote] = repo.confirm
 
-    sandbox = _load_sandbox(raw.get("sandbox"), path, resolved, writable,
-                            protected, aliases)
-    if sandbox:
-        resolved["sandbox"] = sandbox
+    sandbox_roots = _load_sandbox_roots(policy.get("sandbox_roots", []), path, resolved,
+                                        writable, protected, aliases)
+    # One sandbox root is also the path role `sandbox` ($HPC_SANDBOX). With
+    # several, name the ones the agent should know in [paths] yourself.
+    if len(sandbox_roots) == 1 and "sandbox" not in resolved:
+        resolved["sandbox"] = sandbox_roots[0]
 
     profile = _moved(policy, "profile", raw, "profile", profile_mod.DEFAULT,
                      "[policy] profile", "profile", path, warnings)
@@ -443,32 +437,26 @@ def load(name: str | None = None) -> Site:
         protected=[v.rstrip("/") for v in protected],
         root_confirm=root_confirm,
         warnings=tuple(warnings),
-        sandbox=sandbox,
+        sandbox_roots=sandbox_roots,
     )
 
 
-def _load_sandbox(table, path: Path, roles: dict, writable: list,
-                  protected: list, aliases: dict) -> str | None:
-    """Validate ``[sandbox]``: one ``root``, inside a write root (or the
-    scratch role), clear of every protected path, and not already a path
-    role. It widens nothing the profile allows; it only drops the token
-    inside it, so it must lie where writes are allowed at all."""
-    if table is None:
-        return None
-    if not isinstance(table, dict):
-        raise SiteError(f"{path}: [sandbox] must be a table with root = \"...\"")
-    unknown = sorted(set(table) - {"root"})
-    if unknown:
-        raise SiteError(f"{path}: [sandbox]: unknown key(s) {', '.join(unknown)}; known: root")
-    root = table.get("root")
-    if not isinstance(root, str) or not root.strip():
-        raise SiteError(f"{path}: [sandbox] needs root = \"/absolute/dir\"")
-    root = root.strip()
-    _validate_root(root, "[sandbox] root", path)
+def _load_sandbox_roots(roots, path: Path, roles: dict, writable: list,
+                        protected: list, aliases: dict) -> list[str]:
+    """Validate ``[policy] sandbox_roots``: each inside a write root (or the
+    scratch role) and clear of every protected path. A sandbox widens
+    nothing the profile allows; it only drops the token inside it, so it
+    must lie where writes are allowed at all."""
+    if not isinstance(roots, list) or not all(isinstance(v, str) for v in roots):
+        raise SiteError(f"{path}: [policy] sandbox_roots must be a list of strings")
+    return [_check_sandbox_root(r.strip(), path, roles, writable, protected, aliases)
+            for r in roots]
+
+
+def _check_sandbox_root(root: str, path: Path, roles: dict, writable: list,
+                        protected: list, aliases: dict) -> str:
+    _validate_root(root, "sandbox_roots entry", path)
     root = root.rstrip("/")
-    if "sandbox" in roles:
-        raise SiteError(f"{path}: [sandbox] root is the path role 'sandbox'; "
-                        "remove sandbox from [paths]")
     pairs = sorted(((k.rstrip("/"), v.rstrip("/")) for k, v in aliases.items()),
                    key=lambda kv: -len(kv[0]))
 
@@ -486,19 +474,20 @@ def _load_sandbox(table, path: Path, roles: dict, writable: list,
     if roles.get("scratch"):
         allowed.append(canon(roles["scratch"].rstrip("/")))
     if not any(inside(c_root, r) for r in allowed):
-        raise SiteError(f"{path}: [sandbox] root {root!r} is not inside a write "
-                        "root or the scratch role")
+        raise SiteError(f"{path}: sandbox_roots entry {root!r} is not inside a "
+                        "write root or the scratch role")
     for prot in protected:
         c_prot = canon(prot.rstrip("/"))
         if inside(c_root, c_prot) or inside(c_prot, c_root):
-            raise SiteError(f"{path}: [sandbox] root {root!r} overlaps protected "
-                            f"path {prot!r}")
+            raise SiteError(f"{path}: sandbox_roots entry {root!r} overlaps "
+                            f"protected path {prot!r}")
     return root
 
 
 #: Keys each new-style table may hold. Strict, like [repos]: a misspelled
 #: key in [policy] would otherwise silently leave a default in force.
-_POLICY_KEYS = frozenset({"profile", "write_roots", "protected", "nc_max_read_mb"})
+_POLICY_KEYS = frozenset({"profile", "write_roots", "protected", "nc_max_read_mb",
+                          "sandbox_roots"})
 _FILESYSTEM_KEYS = frozenset({"home", "aliases"})
 _ENVIRONMENT_KEYS = frozenset({"python_bin"})
 
@@ -576,17 +565,6 @@ def _load_repos(table, path: Path) -> dict[str, Repo]:
         if "preview" in entry and not trusted:
             raise SiteError(f"{where}: preview applies only to a trusted repo "
                             "(it governs previewing its confirm matches)")
-        scope_option = entry.get("scope_option")
-        if scope_option is not None and (
-                not isinstance(scope_option, str)
-                or not re.match(r"^--?[A-Za-z0-9][A-Za-z0-9_-]*$", scope_option)):
-            raise SiteError(f"{where}: scope_option must be an option name like \"--within\"")
-        always = entry.get("always_confirm", [])
-        if not isinstance(always, list) or not all(isinstance(p, str) for p in always):
-            raise SiteError(f"{where}: always_confirm must be a list of patterns")
-        for key in ("scope_option", "always_confirm"):
-            if key in entry and not trusted:
-                raise SiteError(f"{where}: {key} applies only to a trusted repo")
         repos[name] = Repo(
             name=name,
             local=str(Path(local.strip()).expanduser()) if local else None,
@@ -597,8 +575,6 @@ def _load_repos(table, path: Path) -> dict[str, Repo]:
             role=role,
             confirm=tuple(confirm),
             preview=preview,
-            scope_option=scope_option,
-            always_confirm=tuple(always),
         )
     remotes = sorted((r.remote, r.name) for r in repos.values())
     for (a, an), (b, bn) in zip(remotes, remotes[1:]):

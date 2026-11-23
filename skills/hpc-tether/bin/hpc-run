@@ -288,7 +288,7 @@ def _apply_guard(
         script_roots=target.script_roots,
         repos=target.repos,
         protected=target.protected,
-        sandbox=target.sandbox,
+        sandbox=target.sandbox_roots,
     )
 
     for note in report.notes:

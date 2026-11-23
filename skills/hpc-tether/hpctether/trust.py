@@ -71,9 +71,6 @@ class Roots:
     #: False when the payload assigns HOME: tilde expansion reads $HOME, so
     #: the scan can no longer say what `~` means (see guard.classify).
     tilde: bool = True
-    #: Per root: ``(root, (scope_option, always_confirm patterns))`` from each
-    #: trusted ``[repos.<name>]`` that declares a scope option.
-    scope: tuple[tuple[str, tuple[str, tuple[str, ...]]], ...] = ()
 
     @property
     def home(self) -> str | None:
@@ -90,10 +87,6 @@ class Roots:
             confirm=tuple(site.script_confirm),
             scoped=tuple(sorted((getattr(site, "root_confirm", None) or {}).items())),
             paths=tuple(sorted((site.paths or {}).items())),
-            scope=tuple(sorted(
-                (r.remote, (r.scope_option, tuple(r.always_confirm)))
-                for r in (getattr(site, "repos", None) or {}).values()
-                if r.trusted and r.scope_option)),
         )
 
     def root_of(self, path: str) -> str | None:
@@ -112,11 +105,6 @@ class Use:
     root: str
     args: str
     tier: str  # "free" | "write"
-    #: For a "write" use: the directory named by the repo's scope option, as
-    #: written (None: no scope option given), and whether an
-    #: ``always_confirm`` pattern matched (no scope waives that).
-    scope_dir: str | None = None
-    always: bool = False
 
 
 def expand_tilde(token: str, home: str | None) -> str:
@@ -174,31 +162,9 @@ def _tier(path: str, root: str, args: str, roots: "Roots") -> str:
     return "free"
 
 
-def _scope(path: str, root: str, tokens: list[str], roots: "Roots") -> tuple:
-    """``(scope_dir, always)`` for a confirm-matching use: the value of the
-    repo's scope option, and whether an always_confirm pattern matched."""
-    option, always = dict(roots.scope).get(root, (None, ()))
-    if not option:
-        return None, False
-    rel = path[len(root.rstrip("/")) + 1:]
-    subject = f"{rel} {' '.join(tokens)}".rstrip()
-    hit = any(fnmatch.fnmatchcase(subject, p) for p in always)
-    value = None
-    for k, t in enumerate(tokens):
-        if t == option and k + 1 < len(tokens):
-            value = tokens[k + 1]
-        elif t.startswith(option + "="):
-            value = t[len(option) + 1:]
-    return value, hit
-
-
 def _use(path: str, root: str, rest: list[str], roots: "Roots") -> Use:
     args = " ".join(rest)
-    tier = _tier(path, root, args, roots)
-    if tier != "write":
-        return Use(path, root, args, tier)
-    scope_dir, always = _scope(path, root, rest, roots)
-    return Use(path, root, args, tier, scope_dir, always)
+    return Use(path, root, args, _tier(path, root, args, roots))
 
 
 def match_invocation(tokens: list[str], roots: Roots, cwd: str | None = None) -> Use | None:

@@ -106,13 +106,14 @@ def _refuse(target, remote_path: str, message: str, reason: str, code: int) -> i
 
 
 def _in_sandbox(remote_path: str, target) -> bool:
-    """True if ``remote_path`` lies inside the site's ``[sandbox] root``."""
-    if not getattr(target, "sandbox", None):
+    """True if ``remote_path`` lies inside one of ``[policy] sandbox_roots``."""
+    if not getattr(target, "sandbox_roots", None):
         return False
     ctx = confine.site_context(target)
-    root = confine.canonical(os.path.normpath(target.sandbox), ctx.aliases)
+    roots = tuple(confine.canonical(os.path.normpath(r), ctx.aliases)
+                  for r in target.sandbox_roots)
     return confine.push_refusal(
-        remote_path, dataclasses.replace(ctx, roots=(root,))) is None
+        remote_path, dataclasses.replace(ctx, roots=roots)) is None
 
 
 def _sha256(path: Path) -> str:
@@ -331,8 +332,8 @@ def main(argv: list[str] | None = None) -> int:
     if why:
         return _refuse(target, remote_path, f"REFUSED — {why}",
                        "forbidden at every profile", transport.EXIT_GUARD)
-    # Inside [sandbox] root the write needs no token (design.md, "The
-    # sandbox"): the same floor check, with the sandbox as the only root.
+    # Inside a sandbox root the write needs no token (design.md, "The
+    # sandbox"): the same floor check, with the sandbox roots as the roots.
     in_sandbox = _in_sandbox(remote_path, target)
 
     # --- precheck + backup on the remote -----------------------------------

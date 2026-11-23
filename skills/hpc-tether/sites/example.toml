@@ -32,7 +32,7 @@ profile = "observe"
 
 # Where the agent may write (always with your approval). The scratch path
 # below is always one. Two styles:
-#   sandbox: leave this out, or list one directory kept for the agent;
+#   narrow:  leave this out, or list one directory kept for the agent;
 #   broad:   list the directories you own, and fence off what must never
 #            change with `protected`.
 # The cluster's own permissions already stop writes to other people's files;
@@ -49,6 +49,15 @@ profile = "observe"
 # it, the work belongs in a script in one of your repos.
 # nc_max_read_mb = 100
 
+# Sandbox: directories where what the profile already allows needs no
+# approval -- writes and pushes into them, sbatch of a job script in them,
+# code run after `cd` into one (improvise). Everything else asks as before.
+# It never raises the profile, and a trusted script's confirm match still
+# asks. Each must lie inside a write root (or scratch) and clear every
+# protected path. A single one is also the path role `sandbox`
+# ($HPC_SANDBOX); with several, name them in [paths] yourself.
+# sandbox_roots = ["/scratch/yourusername/sandbox"]
+
 # ── Common paths ──────────────────────────────────────────────────────────
 # Places you work in often, by a name you choose. Each is a shorthand for the
 # agent: `scratch` here is $HPC_SCRATCH inside a payload and `scratch:file` in
@@ -57,15 +66,6 @@ profile = "observe"
 scratch = "/scratch/yourusername"
 work    = "/projects/yourgroup/yourusername"
 output  = "/projects/yourgroup/yourusername/output"
-
-# ── Sandbox (optional) ────────────────────────────────────────────────────
-# A directory where what the profile already allows needs no approval:
-# writes and pushes into it, sbatch of a job script in it, code run after
-# `cd` into it (improvise), and scoped trusted-script actions. It never
-# raises the profile. It must lie inside a write root (or scratch) and clear
-# every protected path. It is also the path role `sandbox` ($HPC_SANDBOX).
-# [sandbox]
-# root = "/scratch/yourusername/sandbox"
 
 # ── Repositories ──────────────────────────────────────────────────────────
 # One entry per code repository on the cluster. Only `remote` is required.
@@ -85,11 +85,6 @@ output  = "/projects/yourgroup/yourusername/output"
 #            it without the action flag and showing you the preview
 #            (default true). See reference/trusted-scripts.md.
 #   role     also name the checkout as a common path ("repo" -> $HPC_REPO).
-#   scope_option    the option with which this repo's scripts confine
-#            themselves to one directory, e.g. "--within". A confirm match
-#            carrying it with a directory inside [sandbox] root needs no
-#            approval. The script must honour it; hpc-tether can't check.
-#   always_confirm  patterns that need approval even then, e.g. ["* --purge*"].
 #
 # [repos.mymodel]
 # remote = "/home/yourusername/mymodel"

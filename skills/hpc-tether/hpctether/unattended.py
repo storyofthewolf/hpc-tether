@@ -2,7 +2,7 @@
 
 On, a session refuses whatever would otherwise ask the user: the approval
 hook denies every token, with a reason the agent can act on. Work that needs
-no token -- reads, and what the profile allows inside ``[sandbox] root`` --
+no token -- reads, and what the profile allows inside the sandbox roots --
 goes on. Off (the default), tokens ask as always.
 
 It grants nothing in either state, so it is not kept with the site file and

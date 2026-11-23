@@ -228,18 +228,20 @@ advance, so iterative work (trials, debugging, benchmarks) asked every few
 minutes, and the user stopped reading the prompts. A prompt approved
 without reading is no approval.
 
-`[sandbox] root` is that advance approval, for one directory the user names
-in the site file. It never raises the level and never changes a kind: a
+`[policy] sandbox_roots` is that advance approval, for directories the user
+names in the site file. It never raises the level and never changes a kind: a
 write is still write tier, code is still interpreter tier. The guard
-classifies the payload a second time with the sandbox as its only write
-root and no `[repos]` mirrors, pairs the two walks in order, and drops the
-token (`Violation.token`) from each construct that stays inside: a file
-write, an `sbatch` whose script paths are inside, code run after `cd` into
-it, a trusted script's confirm match carrying its repo's `scope_option`
-with a directory inside. If the walks don't pair up, nothing is waived.
-`git push`, job control by id (`scancel`, `scontrol`) and `always_confirm`
-patterns keep their token. The root must lie inside a write root and clear
-every protected path.
+classifies the payload a second time with the sandbox roots as its only
+write roots and no `[repos]` mirrors, pairs the two walks in order, and
+drops the token (`Violation.token`) from each construct that stays inside:
+a file write, an `sbatch` whose script paths are inside, code run after
+`cd` into it. If the walks don't pair up, nothing is waived. `git push`,
+job control by id (`scancel`, `scontrol`) and a trusted script's confirm
+match keep their token: the guard can't see where a trusted script writes,
+and a confirm pattern is the user asking to be asked. (A scope option a
+trusted script could carry to confine itself was built and dropped,
+2026-11-23: it coupled the plugin to one repo's flags.) Each root must lie
+inside a write root and clear every protected path.
 
 It steers rather than contains, like the rest. Code run from the sandbox
 can write anywhere the account can. What the sandbox buys is prompts rare
