@@ -174,13 +174,17 @@ class TestPrecheckScript(unittest.TestCase):
         self.assertEqual(self.run_precheck(self.repo / "ignored.csv")[1], "UNTRACKED")
 
     def test_new_file_in_repo(self):
-        self.assertEqual(self.run_precheck(self.repo / "new.csv"), ["MISSING", "UNTRACKED"])
+        self.assertEqual(self.run_precheck(self.repo / "new.csv"), ["MISSING", "UNTRACKED", "DIR"])
 
     def test_outside_any_repo(self):
-        self.assertEqual(self.run_precheck(self.dir / "x.txt"), ["MISSING", "UNTRACKED"])
+        self.assertEqual(self.run_precheck(self.dir / "x.txt"), ["MISSING", "UNTRACKED", "DIR"])
 
     def test_new_directory(self):
         self.assertEqual(self.run_precheck(self.repo / "no" / "such" / "f.csv")[1], "UNTRACKED")
+
+    def test_missing_directory_is_reported(self):
+        # hpc-push creates it before the upload, rather than letting scp fail.
+        self.assertEqual(self.run_precheck(self.repo / "no" / "such" / "f.csv")[2], "NODIR")
 
 
 if __name__ == "__main__":

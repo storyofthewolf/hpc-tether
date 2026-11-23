@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Switch this Claude Code session to unattended, or back.
+
+    hpc-unattended on [HH:MM]   refuse instead of asking, until HH:MM (local)
+    hpc-unattended off          ask again
+    hpc-unattended              show the state
+
+Unattended, the approval hook denies every token instead of asking, so a
+session left overnight never waits on a prompt nobody will answer. Reads,
+and what the profile allows inside ``[sandbox] root``, need no token and go
+on. The switch is per session and grants nothing (reference/design.md,
+"Unattended sessions"). The user switches it with /hpc-tether:unattended.
+
+Exit: 0 ok, 64 usage or no session id.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the installed skill
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hpctether import transport
+from hpctether import unattended
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(allow_abbrev=False,
+        prog="hpc-unattended",
+        description="Switch this Claude Code session to unattended (refuse "
+                    "instead of asking), or back.",
+        epilog="Exit: 0 ok, 64 usage or no session id.",
+    )
+    parser.add_argument("state", nargs="?", choices=("on", "off", "status"),
+                        default="status")
+    parser.add_argument("until", nargs="?", metavar="HH:MM",
+                        help="with on: switch off by itself at this local time")
+    parser.add_argument("--session", metavar="ID",
+                        help="session id (default: $CLAUDE_CODE_SESSION_ID)")
+    args = parser.parse_args(argv)
+
+    session = (args.session or "").strip() or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not session:
+        print("hpc-unattended: no Claude Code session id. Run it as "
+              "/hpc-tether:unattended in the session to switch.", file=sys.stderr)
+        return transport.EXIT_USAGE
+    if args.until and args.state != "on":
+        print("hpc-unattended: a time goes with `on` only", file=sys.stderr)
+        return transport.EXIT_USAGE
+
+    if args.state == "on":
+        try:
+            until = unattended.parse_until(args.until) if args.until else None
+        except ValueError as exc:
+            print(f"hpc-unattended: {exc}", file=sys.stderr)
+            return transport.EXIT_USAGE
+        data = unattended.switch_on(session, until)
+        print(f"hpc-tether: this session is {unattended.describe(data)}. "
+              "Anything that would ask you is refused instead; sandbox work "
+              "and reads go on.")
+    elif args.state == "off":
+        was = unattended.switch_off(session)
+        print("hpc-tether: this session is attended again: tokens ask you."
+              if was else "hpc-tether: this session was already attended.")
+    else:
+        print(f"hpc-tether: this session is {unattended.describe(unattended.current(session))}.")
+    return transport.EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

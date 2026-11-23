@@ -319,6 +319,34 @@ def _decision(kind: str, reason: str) -> dict:
                                    "permissionDecisionReason": reason}}
 
 
+def _unattended(session: str) -> dict | None:
+    """This session's unattended state, if on and unexpired (the format of
+    skills/hpc-tether/hpctether/unattended.py, read here without importing
+    it). Any error reads as off: off means the prompt still appears."""
+    if not session:
+        return None
+    override = os.environ.get("HPC_TETHER_AUDIT")
+    if override:
+        base = os.path.expanduser(override)
+        if base.endswith(".jsonl"):
+            base = os.path.dirname(base)
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".local", "state", "hpc-tether")
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", session) or "none"
+    try:
+        from datetime import datetime, timezone
+        with open(os.path.join(base, "unattended", safe + ".json")) as fh:
+            data = json.load(fh)
+        if not data.get("since"):
+            return None
+        until = data.get("until")
+        if until and datetime.now(timezone.utc) >= datetime.fromisoformat(until):
+            return None
+        return data
+    except Exception:
+        return None
+
+
 def decide(payload: dict) -> dict | None:
     """The hook's decision for one PreToolUse event, or None to stay silent."""
     if payload.get("tool_name") != "Bash":
@@ -332,6 +360,14 @@ def decide(payload: dict) -> dict | None:
         what = describe(command)
     except Exception:  # a summary is a courtesy; the prompt must still appear
         what = ""
+    if _unattended(payload.get("session_id") or ""):
+        head = ("hpc-tether: this %s. " % what) if what else "hpc-tether: "
+        return _decision("deny", (
+            head + "This session is UNATTENDED (the user's /hpc-tether:unattended "
+            "switch), so nothing that needs the user's approval runs ("
+            + ", ".join(used) + "). Do not retry it or look for another way: "
+            "record it for the user's report and carry on with work that needs "
+            "no token (reads, and work inside the sandbox)."))
     if payload.get("permission_mode") == "bypassPermissions":
         # The generic token label said "replace a file" for a
         # push that would have created one; lead with the specific phrase.

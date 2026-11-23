@@ -63,6 +63,7 @@ refuses any payload containing ``rm``.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 import shlex
 import subprocess
@@ -102,6 +103,16 @@ def _refuse(target, remote_path: str, message: str, reason: str, code: int) -> i
     audit.record("refused", target.name, target.host, f"push to {remote_path}", code,
                  extra={"refusal": reason})
     return code
+
+
+def _in_sandbox(remote_path: str, target) -> bool:
+    """True if ``remote_path`` lies inside the site's ``[sandbox] root``."""
+    if not getattr(target, "sandbox", None):
+        return False
+    ctx = confine.site_context(target)
+    root = confine.canonical(os.path.normpath(target.sandbox), ctx.aliases)
+    return confine.push_refusal(
+        remote_path, dataclasses.replace(ctx, roots=(root,))) is None
 
 
 def _sha256(path: Path) -> str:
@@ -148,6 +159,14 @@ else
     *) echo "GIT_ERROR" ;;
   esac
 fi
+if [ -d "$d" ]; then echo "DIR"; else echo "NODIR"; fi
+"""
+
+#: Creates the destination's directory when it is missing: inside the sandbox
+#: with no token, elsewhere in the write roots with --allow-write. One
+#: audited call, before the upload.
+_MKDIR_SCRIPT = """
+mkdir -p -- "$1"
 """
 
 #: Remote commit: re-verify, back up, and swap in the uploaded file.
@@ -312,6 +331,9 @@ def main(argv: list[str] | None = None) -> int:
     if why:
         return _refuse(target, remote_path, f"REFUSED — {why}",
                        "forbidden at every profile", transport.EXIT_GUARD)
+    # Inside [sandbox] root the write needs no token (design.md, "The
+    # sandbox"): the same floor check, with the sandbox as the only root.
+    in_sandbox = _in_sandbox(remote_path, target)
 
     # --- precheck + backup on the remote -----------------------------------
     try:
@@ -345,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
     lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
     remote_state = lines[0] if lines else ""
     git_state = lines[1] if len(lines) > 1 else "GIT_ERROR"
+    dir_state = lines[2] if len(lines) > 2 else "DIR"
 
     if git_state == "TRACKED":
         return _refuse(
@@ -393,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
     # The token comes after the read-only precheck, so the user is never
     # asked to approve a push that would be refused anyway (and a tracked
     # file is refused for being tracked, not for a missing token).
-    if not args.allow_write:
+    if not args.allow_write and not in_sandbox:
         action = ("create" if remote_state == "MISSING"
                   else "replace (the current copy is backed up first)")
         return _refuse(
@@ -403,6 +426,22 @@ def main(argv: list[str] | None = None) -> int:
             "Pass --allow-write to declare the write; the approval hook asks "
             "the user.",
             "no --allow-write; the checks passed", transport.EXIT_GUARD)
+
+    if dir_state == "NODIR":
+        parent = str(Path(remote_path).parent)
+        try:
+            made = transport.run_capture(
+                target, f"set -- {shlex.quote(parent)}\n{_MKDIR_SCRIPT}", timeout=60,
+                audit_extra={"step": "mkdir"})
+        except transport.TransportError as exc:
+            print(f"hpc-push: {exc}", file=sys.stderr)
+            return exc.code
+        if made.returncode != 0:
+            if made.stderr.strip():
+                print(made.stderr.rstrip(), file=sys.stderr)
+            print(f"hpc-push: could not create {parent} (exit {made.returncode}); "
+                  "no file was sent", file=sys.stderr)
+            return made.returncode
 
     # --- transfer to a temp file beside the destination ---------------------
     # Uploading onto the destination directly meant an interrupted scp, a full

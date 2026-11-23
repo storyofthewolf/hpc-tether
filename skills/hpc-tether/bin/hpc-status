@@ -36,6 +36,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hpctether import audit, profile as profile_mod, site as site_mod, transport
+from hpctether import unattended
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[3]
 
@@ -126,6 +127,9 @@ def site_lines() -> list[str]:
         except transport.TransportError as exc:
             conn = f"connection unknown: {exc}"
         out.append(f"{name}: profile {target.profile} ({profile_mod.SUMMARY[target.profile]}) · {conn}")
+        if target.sandbox:
+            out.append(f"{name}: sandbox {target.sandbox} (what the profile allows "
+                       "runs there with no token)")
     return out
 
 
@@ -199,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         note = " (most recent in the log; not run under Claude Code)"
     lines = session_lines(entries, session, args.last, rec)
     lines[0] += note
+    lines.insert(1, "this session: " + unattended.describe(unattended.current(session)))
     for line in lines:
         print(line)
     return transport.EXIT_OK

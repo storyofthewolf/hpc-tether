@@ -370,6 +370,33 @@ class TestStatusBar(Env):
         self.assertEqual(self.bar(), "")
         self.assertEqual(self.calls, [])
 
+    def unattended(self, session, until=None):
+        d = self.log.parent / "unattended"
+        d.mkdir(exist_ok=True)
+        (d / (session + ".json")).write_text(json.dumps(
+            {"since": "2026-11-22T00:00:00+00:00", "until": until}))
+
+    def test_unattended_shows_for_that_session_only(self):
+        self.start()
+        self.skill()
+        self.unattended("S1")
+        self.assertEqual(self.bar(),
+                         "hpc-tether ▸ alpha: profile operate · connected · UNATTENDED")
+        self.assertNotIn("UNATTENDED", self.bar("S2"))
+
+    def test_unattended_shows_before_first_use(self):
+        self.start()
+        self.unattended("S1", "2999-01-01T08:00:00+00:00")
+        self.assertTrue(self.bar().startswith("hpc-tether ▸ UNATTENDED until "))
+
+    def test_expired_or_off_is_not_shown(self):
+        self.start()
+        self.skill()
+        self.unattended("S1", "2000-01-01T08:00:00+00:00")
+        self.assertNotIn("UNATTENDED", self.bar())
+        (self.log.parent / "unattended" / "S1.json").write_text("{}")
+        self.assertNotIn("UNATTENDED", self.bar())
+
     def test_shows_the_status_once_used(self):
         self.start()
         self.skill()

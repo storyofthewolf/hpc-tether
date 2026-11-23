@@ -243,6 +243,48 @@ class TestPlainWords(unittest.TestCase):
         self.assertTrue(r.startswith("Approving --yes"))
 
 
+class TestUnattended(unittest.TestCase):
+    """A session switched to unattended refuses instead of asking."""
+
+    def setUp(self):
+        import os, tempfile
+        from unittest import mock
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"HPC_TETHER_AUDIT": self.tmp.name})
+        self.env.start()
+        d = Path(self.tmp.name) / "unattended"
+        d.mkdir()
+        (d / "S1.json").write_text(json.dumps({"since": "2026-11-22T00:00:00+00:00",
+                                               "until": None}))
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def decide(self, command, session):
+        out = approve.decide({"tool_name": "Bash", "tool_input": {"command": command},
+                              "permission_mode": "auto", "session_id": session})
+        return out and out["hookSpecificOutput"]
+
+    def test_token_is_denied_with_a_reason(self):
+        out = self.decide(f"{BIN}/hpc-run --allow-write -", "S1")
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("UNATTENDED", out["permissionDecisionReason"])
+        self.assertIn("carry on", out["permissionDecisionReason"])
+
+    def test_other_sessions_still_ask(self):
+        self.assertEqual(self.decide(f"{BIN}/hpc-run --allow-write -", "S2")["permissionDecision"],
+                         "ask")
+
+    def test_no_token_stays_silent(self):
+        self.assertIsNone(self.decide(f"{BIN}/hpc-read rundir:a.log --tail 5", "S1"))
+
+    def test_switched_off_asks_again(self):
+        (Path(self.tmp.name) / "unattended" / "S1.json").write_text("{}")
+        self.assertEqual(self.decide(f"{BIN}/hpc-run --allow-write -", "S1")["permissionDecision"],
+                         "ask")
+
+
 if __name__ == "__main__":
     unittest.main()
 

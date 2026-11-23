@@ -61,6 +61,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{target.name}: master live on {target.host} -- {message}")
         print(f"{target.name}: profile {target.profile} -- "
               f"{profile_mod.SUMMARY[target.profile]}")
+        if target.sandbox:
+            print(f"{target.name}: sandbox {target.sandbox} -- what the profile "
+                  "allows runs there with no token")
         for line in notes:
             print(line)
         return transport.EXIT_OK

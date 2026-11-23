@@ -55,6 +55,24 @@ No flag the agent can pass raises the profile. It is set in your site file;
 hooks stop the agent editing that file or pointing the toolkit at another
 one, and a refusal tells it to ask you.
 
+**A profile sets what may be done; it never pre-approves.** At every
+profile, each write and each run of the agent's own code asks you, except
+inside the sandbox.
+
+### Sandbox and unattended sessions (optional)
+
+- **`[sandbox] root`** in your site file names one directory where what your
+  profile already allows runs without asking: writes and pushes into it,
+  jobs whose script is in it, code run from it, and actions of your trusted
+  scripts that confine themselves to it (`scope_option`). It never raises
+  the profile. Everything outside asks as before. See
+  `reference/design.md`, "The sandbox".
+- **`/hpc-tether:unattended on [HH:MM]`** switches one session to refuse
+  instead of asking, so a run left overnight never waits on a prompt. Work
+  in the sandbox and reads go on; anything else is refused and left for
+  your morning. `/hpc-tether:unattended off` ends it, or it ends at `HH:MM`.
+  The status bar shows `sandbox` and `UNATTENDED`.
+
 ## What the toolkit does at every profile
 
 - **It refuses deletions.** `rm` and the other spellings it recognizes are

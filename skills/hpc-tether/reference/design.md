@@ -220,6 +220,45 @@ write, and deletion stays forbidden everywhere. A shallow root (`/`, or one
 level deep) would disarm confinement for the whole filesystem, so the loader
 refuses one.
 
+## The sandbox
+
+A level sets what may be sent; it never pre-approves. Before the sandbox
+there was no setting that turned a prompt into an approval given in
+advance, so iterative work (trials, debugging, benchmarks) asked every few
+minutes, and the user stopped reading the prompts. A prompt approved
+without reading is no approval.
+
+`[sandbox] root` is that advance approval, for one directory the user names
+in the site file. It never raises the level and never changes a kind: a
+write is still write tier, code is still interpreter tier. The guard
+classifies the payload a second time with the sandbox as its only write
+root and no `[repos]` mirrors, pairs the two walks in order, and drops the
+token (`Violation.token`) from each construct that stays inside: a file
+write, an `sbatch` whose script paths are inside, code run after `cd` into
+it, a trusted script's confirm match carrying its repo's `scope_option`
+with a directory inside. If the walks don't pair up, nothing is waived.
+`git push`, job control by id (`scancel`, `scontrol`) and `always_confirm`
+patterns keep their token. The root must lie inside a write root and clear
+every protected path.
+
+It steers rather than contains, like the rest. Code run from the sandbox
+can write anywhere the account can. What the sandbox buys is prompts rare
+enough to read, mistakes that land somewhere cheap, and an overnight run
+that refuses anything outside it.
+
+## Unattended sessions
+
+A prompt nobody will answer stalls a session until morning. The user's
+`/hpc-tether:unattended on [HH:MM]` switches one session to refuse instead:
+the approval hook denies every token with a reason that tells the agent to
+record it and carry on. Work that needs no token (reads, the sandbox) goes
+on. The switch is per session, so other sessions at the desk keep asking.
+It grants nothing in either state (on refuses, off asks), so it lives in
+per-session state rather than the site file and needs no protection from
+the agent; the command is still the user's. The level is also the
+overnight ceiling: `operate` overnight runs jobs and trusted scripts, but
+no code the agent writes.
+
 ## Tokens declare; the prompt approves
 
 A token is a flag the agent passes itself. It still does two jobs: it

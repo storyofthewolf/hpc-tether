@@ -98,7 +98,7 @@ class TestPushPrecheckGitFailure(unittest.TestCase):
             if found and not (empty / tool).exists():
                 os.symlink(found, empty / tool)
         out = self.run_precheck(self.dir / "x.txt", env={"PATH": str(empty)})
-        self.assertEqual(out, ["MISSING", "GIT_UNAVAILABLE"])
+        self.assertEqual(out, ["MISSING", "GIT_UNAVAILABLE", "DIR"])
 
     def test_unknown_state_refuses_the_push(self):
         from unittest import mock

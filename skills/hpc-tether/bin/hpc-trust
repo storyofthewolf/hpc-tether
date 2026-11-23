@@ -50,12 +50,19 @@ def cmd_list(args, target) -> int:
     no_preview = {r.remote for r in target.repos.values() if not r.preview}
     for root in target.script_roots or ["(none declared)"]:
         scoped = target.root_confirm.get(root, ())
+        repo = next((r for r in target.repos.values() if r.remote == root), None)
+        scope = ""
+        if repo and repo.scope_option and target.sandbox:
+            scope = (f"   scope: {repo.scope_option} <dir in sandbox> waives the token"
+                     + (f" except {', '.join(repo.always_confirm)}" if repo.always_confirm else ""))
         print(f"  {root}" + (f"   confirm: {', '.join(scoped)}" if scoped else "")
-              + ("   preview: off" if scoped and root in no_preview else ""))
+              + ("   preview: off" if scoped and root in no_preview else "") + scope)
     if target.script_confirm:
         print("confirm patterns for every root (still need --allow-write):")
         for pattern in target.script_confirm:
             print(f"  {pattern}")
+    if target.sandbox:
+        print(f"sandbox (what the profile allows needs no token): {target.sandbox}")
     if target.protected:
         print("protected (never written):")
         for root in target.protected:

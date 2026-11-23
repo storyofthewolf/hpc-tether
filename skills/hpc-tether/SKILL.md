@@ -84,6 +84,35 @@ On `REFUSED by profile`, **never edit the site file or offer to**: tell the
 user what was refused and which level would allow it, or do the part the
 current level allows.
 
+**A level sets what may be sent; it never pre-approves.** At every level, a
+write and a code run still need their token, and the user is asked, except
+inside the sandbox.
+
+## The sandbox and unattended sessions
+
+If the site sets `[sandbox] root` (`$HPC_SANDBOX`, `sandbox:` in tool
+paths; `hpc-trust list` shows it), what the profile already allows needs
+**no token** there. Send these without one; a token makes the hook ask
+anyway:
+
+- writes and `hpc-push` whose every target is inside (push makes the
+  missing directory);
+- `sbatch` of a job script inside;
+- code run after `cd $HPC_SANDBOX/... &&` (improvise);
+- a trusted script's `confirm` match that carries its repo's scope option
+  (`hpc-trust list`, `scope:`) with a directory inside.
+
+The sandbox never raises the level and never waives `git push`, job control
+by id, or a repo's `always_confirm`. Put work there when the user or the
+project's own rules say it belongs there (trials, debugging, benchmarks,
+scratch inputs, dev clones); everything outside asks as before.
+
+**Unattended.** The user may switch a session to unattended
+(`/hpc-tether:unattended on [HH:MM]`; never run it yourself). There, a token
+is **denied**, not asked. Don't retry it or route around it: note it for the
+user's report and carry on with what needs no token. If `hpc-check` exits
+69, the user can't reconnect until they are back: stop, and write the report.
+
 ## The guard (exit 77)
 
 `hpc-run` classifies every payload before sending it. It reads shell text:

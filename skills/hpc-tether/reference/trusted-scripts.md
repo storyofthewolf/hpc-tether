@@ -121,6 +121,31 @@ real command, which you approve. Set `preview = false` in a repo's entry to
 skip that step for the repo (`hpc-trust list` shows `preview: off`), or say so
 in the session.
 
+## A scope option for sandbox work (optional)
+
+A gated script can also say, in its own command line, that it writes only
+under one directory. Give it an option for that (`--within DIR`): every
+action refuses a target outside `DIR`, and anything the script itself
+writes (generated scripts, logs) goes under `DIR` too. Then name the option
+in the repo's entry:
+
+```toml
+[repos.my-tools]
+trusted        = true
+confirm        = ["* --execute*", "* --send-it*"]
+scope_option   = "--within"
+always_confirm = ["* --purge*"]    # deleting still asks, scope or not
+```
+
+A `confirm` match carrying `--within` with a directory inside `[sandbox]
+root` then needs no token, so it doesn't ask. hpc-tether can't check that
+the script honours the option; it trusts that the same way it trusts the
+script at all. Keep the option an ordinary feature of the script, with no
+knowledge of hpc-tether: it should mean the same thing from your own
+terminal. If the script's idea of the directory and the site file's
+`[sandbox] root` drift apart, the option names a directory outside the
+sandbox and the call asks again, so a mismatch fails toward asking.
+
 ## What stays open
 
 - **Git is the review, and the toolkit can't check that you reviewed.** If an

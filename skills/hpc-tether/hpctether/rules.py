@@ -19,13 +19,14 @@ something it read. They read text; they are not a sandbox.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from hpctether import confine
 from hpctether.commands import (
     FORBIDDEN_ALWAYS,
     DELETION_CMDS,
     WRITE_CMDS,
+    NO_FILE_TARGET,
     INTERPRETERS,
     SHELLS,
     EDITORS,
@@ -82,8 +83,16 @@ class Violation:
     #: False for a write that needs no ``--allow-write``: it is still write
     #: tier for the profile, still confined to the write roots, and still
     #: audited, but the user is not asked (see design.md, "Git writes that
-    #: can be undone").
+    #: can be undone", and "The sandbox").
     token: bool = True
+    #: False where the sandbox never waives the token: a git push, job
+    #: control other than sbatch, an always_confirm match.
+    sandboxable: bool = True
+    #: For a construct whose target is not a plain file write -- an sbatch
+    #: script, a trusted script's scope directory, an interpreter's working
+    #: directory -- whether that target lies inside the roots this scan was
+    #: given. None: decided by the kind (a write that was not refused).
+    in_roots: "bool | None" = None
 
 
 @dataclass
@@ -123,14 +132,15 @@ IN_PLACE = (
 
 def confined_write(
     why: str | None, lineno: int, line: str, message: str, command: str = "",
-    token: bool = True,
+    token: bool = True, sandboxable: bool = True,
 ) -> Violation:
     """A write-tier violation, or a forbidden one if it lands outside the
     write roots. Confinement is floor (hpctether/confine.py): no profile and
     no token sends an unconfined write."""
     if why:
         return Violation(FORBIDDEN, lineno, line, why, command=command)
-    return Violation(WRITE, lineno, line, message, command=command, token=token)
+    return Violation(WRITE, lineno, line, message, command=command, token=token,
+                     sandboxable=sandboxable)
 
 
 def unknown_form(lineno: int, line: str, why: str, command: str = "") -> Violation:
@@ -286,10 +296,13 @@ def trusted_script(c: Command):
         c.uses.append(use)
     if use.tier == "free":
         return []
+    scoped = bool(use.scope_dir) and not use.always and c.ctx is not None
+    in_roots = scoped and confine.check_path(use.scope_dir, c.ctx, "scope") is None
     return [c.v(WRITE,
                 f"pre-built script {use.path} with arguments {use.args!r} matches "
                 "a script_confirm pattern in the site file — needs --allow-write "
-                "and per-use user confirmation")]
+                "and per-use user confirmation",
+                sandboxable=scoped, in_roots=in_roots)]
 
 
 #: Interpreter flags that take a glued argument, so the letters after them
@@ -650,7 +663,7 @@ def git(c: Command):
         return [Violation(WRITE, c.lineno, c.line,
                           f"git {sub} in {repo.name} ({repo.mode} mirror, site [repos]) — "
                           + _git_token_note(token),
-                          repo=repo.name, token=token)]
+                          repo=repo.name, token=token, sandboxable=False)]
     if sub in GIT_DUAL_MODE:
         # Bare (`git branch`) or an explicit listing flag reads; anything
         # else -- a value to set, a branch to delete -- writes. A read flag
@@ -662,14 +675,14 @@ def git(c: Command):
             return [confined_write(
                 confine.git_refusal(tokens, sub, ctx), c.lineno, c.line,
                 f"git {sub} in this form changes the remote checkout — "
-                + _git_token_note(token), token=token)]
+                + _git_token_note(token), token=token, sandboxable=not token)]
         return []
     if sub is not None and sub not in GIT_READ:
         token = git_needs_token(sub, args_after_sub)
         return [confined_write(
             confine.git_refusal(tokens, sub, ctx), c.lineno, c.line,
             f"git {sub} writes to the remote checkout — "
-            + _git_token_note(token), token=token)]
+            + _git_token_note(token), token=token, sandboxable=not token)]
     return []
 
 
@@ -684,7 +697,7 @@ def scontrol(c: Command):
         return None
     sub = next((t for t in c.tokens[1:] if not t.startswith("-")), None)
     if sub not in ("show", None):
-        return [c.v(WRITE, f"scontrol {sub} changes scheduler state", command="scontrol")]
+        return [c.v(WRITE, f"scontrol {sub} changes scheduler state", command="scontrol", sandboxable=False)]
     return []
 
 
@@ -812,10 +825,32 @@ def write_command(c: Command):
                 else unknown_form(c.lineno, c.line, why, c.cmd)]
     if confine.writes_nothing(c.cmd, c.tokens):
         return []  # `gzip -c f`: output to stdout; a redirect is checked above
-    return [confined_write(
+    v = confined_write(
         confine.refusal(c.cmd, c.tokens, c.ctx), c.lineno, c.line,
         f"{c.cmd} changes remote state — needs --allow-write and "
-        "per-use user confirmation", command=c.cmd)]
+        "per-use user confirmation", command=c.cmd)
+    if v.kind == WRITE and c.cmd == "sbatch":
+        v = replace(v, in_roots=_sbatch_script_in_roots(c))
+    elif v.kind == WRITE and c.cmd in NO_FILE_TARGET:
+        # scancel/kill name a job, not a path: the sandbox can't place it.
+        v = replace(v, sandboxable=False)
+    return [v]
+
+
+#: File names an sbatch job script is commonly given.
+_JOB_SCRIPT_SUFFIXES = (".sh", ".bash", ".csh", ".run", ".slurm", ".job", ".sbatch")
+
+
+def _sbatch_script_in_roots(c: Command) -> bool:
+    """True if every path-like operand of an sbatch (the job script, and any
+    other path) lies inside the roots this scan was given. Option values
+    (``-t 00:30:00``) are not path-like and are skipped."""
+    if c.ctx is None:
+        return False
+    operands = [t for t in c.tokens[1:] if not t.startswith("-")]
+    paths = [t for t in operands if "/" in t or t.endswith(_JOB_SCRIPT_SUFFIXES)]
+    return bool(paths) and all(
+        confine.check_path(t, c.ctx, "sbatch script") is None for t in paths)
 
 
 def read_options(c: Command):

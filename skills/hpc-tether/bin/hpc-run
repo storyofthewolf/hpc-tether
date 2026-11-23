@@ -288,6 +288,7 @@ def _apply_guard(
         script_roots=target.script_roots,
         repos=target.repos,
         protected=target.protected,
+        sandbox=target.sandbox,
     )
 
     for note in report.notes:
@@ -364,6 +365,8 @@ def _apply_guard(
         refused = interpreters + writes
         return transport.EXIT_GUARD, [], needed, [], refused[0].line if refused else None
 
+    # Code run from inside the sandbox needs no token (Violation.token).
+    interpreters = [v for v in interpreters if v.token]
     if interpreters and not allow_exec:
         _print_violations(
             interpreters,

@@ -337,6 +337,8 @@ def site_line(name):
     text = p.stdout + p.stderr
     m = re.search(r"profile (\w+)", text)
     profile = ("profile " + m.group(1)) if m else None
+    if profile and re.search(r"sandbox /\S+", text):
+        profile += " · sandbox"
     if p.returncode == 0:
         conn = "connected"
     elif p.returncode == 69:
@@ -472,15 +474,40 @@ def cached_site_line(name):
     return line
 
 
+def unattended_label(session):
+    """``UNATTENDED until 08:00`` for this session, or "" (the state file of
+    skills/hpc-tether/hpctether/unattended.py, read fresh, never cached)."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", session) or "none"
+    try:
+        with open(os.path.join(audit_dir(), "unattended", safe + ".json")) as fh:
+            data = json.load(fh)
+        if not data.get("since"):
+            return ""
+        until = data.get("until")
+        if not until:
+            return "UNATTENDED"
+        end = datetime.fromisoformat(until)
+        if datetime.now(timezone.utc) >= end:
+            return ""
+        return "UNATTENDED until " + end.astimezone().strftime("%H:%M")
+    except Exception:
+        return ""
+
+
 def statusline(event):
     """The status bar: nothing until the plugin is used in this session."""
     session = event.get("session_id") or ""
-    if not session or setting() == "off" or not announced(session):
+    if not session or setting() == "off":
         return ""
+    alone = unattended_label(session)
+    if not announced(session):
+        # Switching unattended on is itself a use worth showing.
+        return (PREFIX + alone) if alone else ""
     names = site_names()
     if not names:
         return PREFIX + "no site file"
-    return PREFIX + " | ".join(cached_site_line(n) for n in names)
+    line = " | ".join(cached_site_line(n) for n in names)
+    return PREFIX + line + ((" · " + alone) if alone else "")
 
 
 def main():

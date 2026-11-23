@@ -187,6 +187,7 @@ def classify(
     script_roots: "list[str] | None" = None,
     repos=None,
     protected: "list[str] | None" = None,
+    sandbox: "str | None" = None,
 ) -> Report:
     """Classify every command in ``script``.
 
@@ -211,6 +212,11 @@ def classify(
             role-spelled ``cd`` is resolved at all.
         protected: ``[policy] protected``: directories never written, even
             inside a write root.
+        sandbox: ``[sandbox] root``, or None. The payload is classified a
+            second time with the sandbox as its only write root; a write,
+            sbatch, scoped trusted-script action or interpreter call that
+            stays inside it loses its token (``Violation.token`` False). It
+            never changes a kind, so the profile's verdict is untouched.
         repos: the site's ``[repos]`` (name -> :class:`hpctether.site.Repo`).
             A git write in a listed checkout follows that entry's mode
             instead of the write roots (see ``rules._repo_sync_refusal``).
@@ -218,6 +224,44 @@ def classify(
     Returns:
         Report: every violation found, in source order.
     """
+    report = _classify(script, roots, scratch, trust, paths, aliases,
+                       script_roots, repos, protected)
+    if not sandbox or not any(v.kind in (WRITE, INTERPRETER, UNKNOWN)
+                              for v in report.violations):
+        return report
+    inside = _classify(script, [sandbox], None, trust, paths, aliases,
+                       script_roots, None, protected)
+    return _waive_inside(report, inside)
+
+
+def _waive_inside(report: "Report", inside: "Report") -> "Report":
+    """Drop the token from each gated construct that stays in the sandbox.
+
+    ``inside`` is the same payload classified with the sandbox as the only
+    write root (and no [repos] mirrors, so a listed checkout is placed by its
+    path like anything else). The two walks are the same walk over the same
+    text, so their violations pair up in order. If they don't (a different
+    count, or a different line), nothing is waived: an unmatched pairing
+    falls back to asking.
+    """
+    a, b = report.violations, inside.violations
+    if len(a) != len(b) or any(v.lineno != w.lineno for v, w in zip(a, b)):
+        return report
+    out = []
+    for v, w in zip(a, b):
+        if v.token and v.sandboxable and v.kind in (WRITE, INTERPRETER, UNKNOWN):
+            if w.in_roots is not None:
+                stays = w.in_roots
+            else:
+                stays = v.kind == WRITE and w.kind == WRITE
+            if stays:
+                v = dataclasses.replace(v, token=False)
+        out.append(v)
+    return dataclasses.replace(report, violations=out)
+
+
+def _classify(script, roots, scratch, trust, paths, aliases, script_roots,
+              repos, protected) -> "Report":
     trust_index = trust if trust else None
     loader_var = _loader_env_set(script) if trust_index else None
     if loader_var:
@@ -283,9 +327,17 @@ def classify(
                     FORBIDDEN, lineno, raw.rstrip(), _role_message(role, "setting")))
                 continue
             ctx = dataclasses.replace(base_ctx, cwd=seg.write_dir or start_dir)
+            found = _check_segment(seg.text.strip(), lineno, raw.rstrip(), ctx,
+                                   trust_index, collected, seg.cd_dir)
+            # Code the guard can't read is placed by where it runs: the
+            # directory a `cd DIR &&` on its line moved to.
             report.violations.extend(
-                _check_segment(seg.text.strip(), lineno, raw.rstrip(), ctx,
-                               trust_index, collected, seg.cd_dir))
+                dataclasses.replace(v, in_roots=bool(
+                    seg.write_dir and confine.confined(
+                        confine.canonical(posixpath.normpath(seg.write_dir), alias_pairs),
+                        canon_roots)))
+                if v.kind in (INTERPRETER, UNKNOWN) and v.in_roots is None else v
+                for v in found)
         # A trusted use found on the masked line records its real arguments.
         if parsed.originals:
             for k in range(n_before, len(collected)):
