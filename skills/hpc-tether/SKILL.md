@@ -125,7 +125,9 @@ payload, or re-spell it in Python or a nested shell, to get it through.
   the user the `hpc-trust check -` output for it: teaching the guard a
   command is the maintainer's change, never yours. `hpc-probe`'s own `srun` is fixed and read-only.
 - **Write: `prepare` plus `--allow-write`**, every target inside a write
-  root. Job control (`sbatch`, `scancel <id>`, `kill`, `scontrol` changes)
+  root. Git writes that git can undo (`fetch`, `pull`, `clone`, `commit`,
+  ...) need no token; `push`, `config` and anything that discards work keep
+  it (`reference/git-sync.md`). Job control (`sbatch`, `scancel <id>`, `kill`, `scontrol` changes)
   needs `operate`. Read a `mv`'s source and destination back to the user.
 
 The guard is not a security boundary: never say a thing is "impossible" or

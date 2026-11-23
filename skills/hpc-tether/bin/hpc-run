@@ -387,6 +387,8 @@ def _apply_guard(
             print(_heredoc_hint(), file=sys.stderr)
         return transport.EXIT_GUARD, [], needed, [], interpreters[0].line
 
+    # A write that can be undone (most git) needs no token; see Violation.token.
+    writes = [w for w in writes if w.token]
     if writes and not allow_write:
         _print_violations(
             writes,

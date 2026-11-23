@@ -62,7 +62,13 @@ mode there.
 
 Reads (`status`, `log`, `diff`, `branch`, `config --get`, `stash list`, ...)
 are free in both modes. Every allowed write is write tier: profile `prepare`
-or above, `--allow-write`, and the user's approval of that exact command.
+or above. A write git can undo (`fetch`, `pull`, `clone`, `add`, `commit`,
+`merge`, `switch` without a discarding flag, `stash` other than `drop`/`clear`,
+`branch NAME`, `tag NAME`) needs **no token** and no prompt: send it without
+`--allow-write`. Every other git write keeps the token and the user's
+approval: `push`, `config`, `remote`, and anything that can discard work or
+the reflog (`checkout`, `restore`, `reset`, `rebase`, `gc`, `stash drop`,
+`branch -D`).
 
 **The origin check.** Before a payload that writes with git in a listed
 checkout runs its first line, it compares that checkout's `origin` with the
@@ -81,8 +87,7 @@ List a repository to get them.
 local:    git commit ...; git push origin main          (the user's or local tools)
 check:    bin/hpc-sync-status mymodel                   (read-only)
           -> "cluster is 2 behind origin/main: a fast-forward pull brings it up"
-propose:  git -C /home/me/mymodel pull --ff-only        (say it; wait for approval)
-run:      echo 'git -C /home/me/mymodel pull --ff-only' | bin/hpc-run --allow-write -
+run:      echo 'git -C /home/me/mymodel pull --ff-only' | bin/hpc-run -   (no token: git can undo it)
 verify:   bin/hpc-sync-status mymodel                   -> "in sync"
 ```
 

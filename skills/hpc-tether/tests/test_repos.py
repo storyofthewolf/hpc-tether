@@ -156,3 +156,51 @@ class TestStash(unittest.TestCase):
         self.assertEqual(worst("git -C /data/r stash", repos={}), guard.FORBIDDEN)
         self.assertIsNone(worst("git -C /data/r stash list", repos={}))
         self.assertIsNone(worst("git -C /data/r stash show", repos={}))
+
+
+class TestGitToken(unittest.TestCase):
+    """Git writes that can be undone need no --allow-write (Violation.token
+    False). They stay write tier and confined; the rest keep the token."""
+
+    def tokens(self, script):
+        writes = report(script).of_kind(guard.WRITE)
+        self.assertEqual(len(writes), 1, script)
+        return writes[0].token
+
+    def test_undoable_writes_need_no_token(self):
+        for s in ("git -C /home/u/model fetch",
+                  "git -C /home/u/model pull --ff-only",
+                  "git -C /home/u/model switch feature-x",
+                  "git -C /home/u/tool commit -m x",
+                  "git -C /home/u/tool add a.py",
+                  "git -C /home/u/tool merge main",
+                  "git clone https://example.org/x.git /scratch/u/x",
+                  "git -C /scratch/u/x pull",
+                  "git -C /scratch/u/x stash",
+                  "git -C /scratch/u/x stash pop",
+                  "git -C /scratch/u/x branch topic",
+                  "git -C /scratch/u/x tag v1"):
+            with self.subTest(s=s):
+                self.assertFalse(self.tokens(s))
+
+    def test_publishing_or_discarding_keeps_the_token(self):
+        for s in ("git -C /home/u/tool push",
+                  "git -C /scratch/u/x push origin main",
+                  "git -C /scratch/u/x config core.pager less",
+                  "git -C /scratch/u/x remote add up https://example.org/y.git",
+                  "git -C /scratch/u/x checkout -- a.py",
+                  "git -C /scratch/u/x restore a.py",
+                  "git -C /scratch/u/x reset HEAD~1",
+                  "git -C /scratch/u/x rebase main",
+                  "git -C /scratch/u/x switch --discard-changes main",
+                  "git -C /scratch/u/x stash drop",
+                  "git -C /scratch/u/x branch -D topic",
+                  "git -C /scratch/u/x tag -d v1",
+                  "git -C /scratch/u/x gc --prune=now"):
+            with self.subTest(s=s):
+                self.assertTrue(self.tokens(s))
+
+    def test_still_confined_without_a_token(self):
+        # Outside the write roots and unlisted: forbidden, token or not.
+        self.assertEqual(worst("git clone https://example.org/x.git /proj/x"),
+                         guard.FORBIDDEN)

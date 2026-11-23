@@ -233,6 +233,20 @@ wrapping. The parser it replaced missed `bash -c '...'` and `env -i ...`
 removed: a written grant was the agent's own reading of the
 user's words, not the user's approval.
 
+## Git writes that can be undone
+
+A git write that git itself can undo (`fetch`, `pull`, `clone`, `add`,
+`commit`, `merge`, a `switch` that discards nothing, a `stash` that drops
+nothing, a new branch or tag) needs no token. It is still write tier for the
+profile, still confined to the write roots or its `[repos]` mode, and still
+in the audit log, but the user is not asked. Git writes that can't be undone
+were refused already (force push, `reset --hard`, `clean`). Those that
+publish, change what git runs, or can discard uncommitted work or the reflog
+keep the token: `push`, `config`, `remote`, `checkout`, `restore`, `reset`,
+`rebase`, `gc`, `stash drop`, `branch -D`. The reason is prompt load: a
+prompt the user approves without reading is no approval, and `pull
+--ff-only` was a routine one.
+
 ## Trusted scripts
 
 The guard is strict where it can read (hand-written shell) and permissive with

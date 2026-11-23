@@ -218,6 +218,21 @@ class TestHpcRunLevels(unittest.TestCase):
                 self.assertEqual(code, transport.EXIT_GUARD)
                 self.assertEqual(row["refusal"], "needs " + token)
 
+    def test_undoable_git_needs_no_token(self):
+        pull = "git -C $HPC_SCRATCH/clone pull --ff-only\n"
+        push = "git -C $HPC_SCRATCH/clone push\n"
+        with Sites("prepare"):
+            code, _, err = _run(self.mod, ["--site", "testsite", "--dry-run", "-"], pull)
+            self.assertEqual(code, 0, err)
+            code, _, err = _run(self.mod, ["--site", "testsite", "--dry-run", "-"], push)
+            self.assertEqual(code, transport.EXIT_GUARD)
+            self.assertIn("--allow-write was not given", err)
+        # Still a write: observe refuses it for the profile.
+        with Sites("observe"):
+            code, _, err = _run(self.mod, ["--site", "testsite", "--dry-run", "-"], pull)
+        self.assertEqual(code, transport.EXIT_GUARD)
+        self.assertIn("REFUSED by profile", err)
+
     def test_profile_refusal_precedes_token_refusal(self):
         # At observe a write is refused for the profile, not for a missing
         # --allow-write: asking the user to approve it would be pointless.

@@ -79,6 +79,11 @@ class Violation:
     #: The site ``[repos]`` entry a git write operates in, if any. The
     #: transport checks that checkout's origin before the payload runs.
     repo: str = ""
+    #: False for a write that needs no ``--allow-write``: it is still write
+    #: tier for the profile, still confined to the write roots, and still
+    #: audited, but the user is not asked (see design.md, "Git writes that
+    #: can be undone").
+    token: bool = True
 
 
 @dataclass
@@ -118,13 +123,14 @@ IN_PLACE = (
 
 def confined_write(
     why: str | None, lineno: int, line: str, message: str, command: str = "",
+    token: bool = True,
 ) -> Violation:
     """A write-tier violation, or a forbidden one if it lands outside the
     write roots. Confinement is floor (hpctether/confine.py): no profile and
     no token sends an unconfined write."""
     if why:
         return Violation(FORBIDDEN, lineno, line, why, command=command)
-    return Violation(WRITE, lineno, line, message, command=command)
+    return Violation(WRITE, lineno, line, message, command=command, token=token)
 
 
 def unknown_form(lineno: int, line: str, why: str, command: str = "") -> Violation:
@@ -478,6 +484,36 @@ def _git_reads(sub: str | None, args: list[str]) -> bool:
                         and (not operands or (query and len(operands) == 1)))
 
 
+#: git writes that can be undone (from the reflog, or by another commit) and
+#: so need no ``--allow-write``. Everything else that writes keeps the token:
+#: ``push`` (it publishes), ``config`` and ``remote`` (they can make git run a
+#: program, or fetch from somewhere else), and anything that can discard
+#: uncommitted work or the reflog (``checkout``, ``restore``, ``reset``,
+#: ``rebase``, ``gc``, ``reflog``, ``stash drop``, ``branch -D``, ...).
+_GIT_UNDOABLE = frozenset({"fetch", "pull", "clone", "add", "commit", "merge"})
+#: ``git switch`` flags that throw away local changes or reset a branch.
+_SWITCH_DISCARD = frozenset({"-f", "--force", "--discard-changes", "-C", "--force-create"})
+#: ``git stash`` subcommands that keep every stash.
+_STASH_UNDOABLE = frozenset({"push", "save", "apply", "pop", "list", "show"})
+
+
+def git_needs_token(sub: str | None, args: list[str]) -> bool:
+    """True unless ``git <sub> <args>`` is a write that can be undone."""
+    flags = [a for a in args if a.startswith("-")]
+    operands = [a for a in args if not a.startswith("-")]
+    if sub in _GIT_UNDOABLE:
+        return False
+    if sub == "switch":
+        return any(f in _SWITCH_DISCARD for f in flags)
+    if sub == "stash":
+        return bool(operands) and operands[0] not in _STASH_UNDOABLE
+    if sub in ("branch", "tag"):
+        # `git branch NAME` and `git tag NAME` add a ref; any flag may delete,
+        # move or force one.
+        return bool(flags)
+    return True
+
+
 #: ``git switch`` flags that only steer output or tracking.
 _SWITCH_SAFE_FLAGS = frozenset({"-q", "--quiet", "--progress", "--no-progress",
                                 "-t", "--track", "--no-track", "--guess", "--no-guess",
@@ -610,10 +646,11 @@ def git(c: Command):
         why = _repo_sync_refusal(repo, sub, args_after_sub)
         if why:
             return [c.v(FORBIDDEN, why)]
-        return [c.v(WRITE,
-                    f"git {sub} in {repo.name} ({repo.mode} mirror, site [repos]) — "
-                    "needs --allow-write and per-use user confirmation",
-                    repo=repo.name)]
+        token = git_needs_token(sub, args_after_sub)
+        return [Violation(WRITE, c.lineno, c.line,
+                          f"git {sub} in {repo.name} ({repo.mode} mirror, site [repos]) — "
+                          + _git_token_note(token),
+                          repo=repo.name, token=token)]
     if sub in GIT_DUAL_MODE:
         # Bare (`git branch`) or an explicit listing flag reads; anything
         # else -- a value to set, a branch to delete -- writes. A read flag
@@ -621,17 +658,25 @@ def git(c: Command):
         # to read, and reads it), so a query flag admits a single
         # non-flag argument; two would be `config key value`, a write.
         if not _git_reads(sub, args_after_sub):
+            token = git_needs_token(sub, args_after_sub)
             return [confined_write(
                 confine.git_refusal(tokens, sub, ctx), c.lineno, c.line,
                 f"git {sub} in this form changes the remote checkout — "
-                "needs --allow-write and per-use user confirmation")]
+                + _git_token_note(token), token=token)]
         return []
     if sub is not None and sub not in GIT_READ:
+        token = git_needs_token(sub, args_after_sub)
         return [confined_write(
             confine.git_refusal(tokens, sub, ctx), c.lineno, c.line,
-            f"git {sub} writes to the remote checkout — needs "
-            "--allow-write and per-use user confirmation")]
+            f"git {sub} writes to the remote checkout — "
+            + _git_token_note(token), token=token)]
     return []
+
+
+def _git_token_note(token: bool) -> str:
+    if token:
+        return "needs --allow-write and per-use user confirmation"
+    return "no token: git can undo it"
 
 
 def scontrol(c: Command):
