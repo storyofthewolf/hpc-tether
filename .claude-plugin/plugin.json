@@ -1,7 +1,7 @@
 {
   "name": "hpc-tether",
   "displayName": "HPC Tether",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Audited access to an HPC cluster over an SSH ControlMaster: four user-set profiles (observe, prepare, operate, improvise; observe runs only the fixed tools), a payload guard that steers the agent away from common mistakes such as deletions and writes outside your write roots, an approval prompt for every write, read-only netCDF inspection, and SLURM job checks.",
   "author": {
     "name": "Eric Wolf"
