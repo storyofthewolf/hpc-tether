@@ -130,6 +130,8 @@ def site_lines() -> list[str]:
         for root in target.sandbox_roots:
             out.append(f"{name}: sandbox {root} (what the profile allows "
                        "runs there with no token)")
+        for note in target.warnings:
+            out.append(f"{name}: site file: {note}")
     return out
 
 

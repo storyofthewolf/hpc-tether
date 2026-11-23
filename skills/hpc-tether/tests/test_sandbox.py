@@ -138,6 +138,19 @@ class TestSiteFile(unittest.TestCase):
         self.assertEqual(len(s.sandbox_roots), 2)
         self.assertNotIn("sandbox", s.paths)
 
+    def test_a_stray_sandbox_table_is_named(self):
+        # It was silently ignored: the sandbox just wasn't there.
+        text = SANDBOX_TOML.format(profile="prepare").replace(
+            'sandbox_roots = ["/scratch/tester/sandbox"]\n', '') + (
+            '\n[sandbox]\nsandbox_roots = "/scratch/tester/sandbox"\n')
+        s = self.load(text)
+        self.assertEqual(s.sandbox_roots, [])
+        self.assertTrue(any("[sandbox]" in w and "under [policy]" in w for w in s.warnings),
+                        s.warnings)
+
+    def test_known_keys_draw_no_warning(self):
+        self.assertEqual(self.load(SANDBOX_TOML.format(profile="prepare")).warnings, ())
+
     def test_not_a_list(self):
         bad = SANDBOX_TOML.format(profile="prepare").replace(
             '["/scratch/tester/sandbox"]', '"/scratch/tester/sandbox"')

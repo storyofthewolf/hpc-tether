@@ -59,19 +59,67 @@ one, and a refusal tells it to ask you.
 profile, each write and each run of the agent's own code asks you, except
 inside the sandbox.
 
-### Sandbox and unattended sessions (optional)
+## A sandbox for iterative work (optional)
 
-- **`sandbox_roots`** under `[policy]` in your site file names directories
-  where what your profile already allows runs without asking: writes and
-  pushes into them, jobs whose script is in one, code run from one. It
-  never raises the profile, and your trusted scripts' `confirm` patterns
-  still ask. Everything outside asks as before. See
-  `reference/design.md`, "The sandbox".
-- **`/hpc-tether:unattended on [HH:MM]`** switches one session to refuse
-  instead of asking, so a run left overnight never waits on a prompt. Work
-  in the sandbox and reads go on; anything else is refused and left for
-  your morning. `/hpc-tether:unattended off` ends it, or it ends at `HH:MM`.
-  The status bar shows `sandbox` and `UNATTENDED`.
+Debugging, benchmarks, scaling tests and other trial runs are many small
+steps: push a script, make a directory, submit, look, change one thing,
+submit again. With a prompt for every write, that is a prompt every few
+minutes, and prompts approved without reading protect nothing. A sandbox
+is your approval given in advance for one place.
+
+Name the directories in your site file, under `[policy]`:
+
+```toml
+[policy]
+profile       = "improvise"
+write_roots   = ["/scratch/yourusername"]
+sandbox_roots = ["/scratch/yourusername/sandbox"]
+```
+
+Inside a sandbox root, whatever your profile already allows runs without
+asking. Outside it, nothing changes.
+
+| Inside a sandbox root | Still asks |
+|---|---|
+| writes: `mkdir`, `cp`, redirects, `ncap2 -O` into it | anything that writes outside it |
+| `hpc-push` into it (missing directories are created) | `git push` |
+| `sbatch` of a job script that lives in it | `scancel`/`scontrol` by job id |
+| code the agent writes, run after `cd` into it (`improvise` only) | a trusted script's `confirm` match |
+
+- **It never raises the profile.** At `operate`, the agent's own code is
+  refused in the sandbox as everywhere else. The profile says what may be
+  done; the sandbox says where it needs no prompt.
+- **It must lie inside your write roots** and clear of every `protected`
+  path. One root is also `$HPC_SANDBOX` in a payload and `sandbox:` in a
+  tool path. List several to cover more than one filesystem.
+- **The agent works there when you or your project's conventions say so**,
+  for example "trials go in the sandbox". hpc-tether only checks paths. Work
+  that lands outside simply asks, as it does today.
+- **It steers; it doesn't contain.** Code run from the sandbox can still
+  write anywhere your account can. What it buys is prompts rare enough to
+  read, mistakes that land somewhere cheap, and a safe place for unattended
+  runs. Nothing anywhere allows a deletion.
+
+`hpc-check`, `hpc-status` and `hpc-trust list` show the sandbox roots, and
+the status bar shows `sandbox`. Details: `reference/design.md`, "The
+sandbox".
+
+### Unattended sessions
+
+A prompt nobody answers stalls a session until morning. Before you leave a
+session working, type in it:
+
+```
+/hpc-tether:unattended on 08:00
+```
+
+Until 08:00 (or `/hpc-tether:unattended off`), anything in that session
+that would ask you is refused instead, with a reason that tells the agent
+to note it for you and carry on. Sandbox work and reads go on. Other
+sessions keep asking as usual. The status bar shows `UNATTENDED until
+08:00`. The switch grants nothing: on, outside work is refused; off, it
+asks. Your profile still sets the ceiling: at `operate`, an unattended
+session runs jobs and your trusted scripts but no code the agent writes.
 
 ## What the toolkit does at every profile
 
@@ -137,9 +185,11 @@ Then create your site file. Copy the template
 
 - `user`, and your `scratch` path under `[paths]`.
 - `[policy]` first: leave `profile = "observe"` until you have watched it
-  work; set `write_roots` (a sandbox directory, or the directories that are
+  work; set `write_roots` (one directory kept for the agent, or the directories that are
   yours alone, never a whole group area) and any `protected` paths inside
   them that must never change.
+- `sandbox_roots` under `[policy]`, optional: see "A sandbox for iterative
+  work" above.
 - `[repos.<name>]` for each code repository on the cluster; `local` if you
   also have it here, `trusted = true` if its scripts may run with no token.
 - `[filesystem] aliases` if a directory has two spellings: on GPFS

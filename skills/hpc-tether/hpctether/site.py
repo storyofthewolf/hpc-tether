@@ -294,6 +294,15 @@ def load(name: str | None = None) -> Site:
         raise SiteError(dispatch_unsupported(scheduler, path))
 
     warnings: list[str] = []
+    # A key nothing reads used to be dropped silently: a sandbox written as
+    # its own [sandbox] table simply wasn't there. Say so, without refusing
+    # the file (a stray key grants nothing).
+    for key in sorted(set(raw) - _TOP_KEYS):
+        what = f"[{key}]" if isinstance(raw[key], dict) else f"{key!r}"
+        hint = (": the sandbox is sandbox_roots = [...] under [policy]"
+                if key == "sandbox" else "")
+        warnings.append(f"{what} is not a setting hpc-tether knows, so it is "
+                        f"ignored{hint}")
     policy = _table(raw, "policy", _POLICY_KEYS, path)
     filesystem = _table(raw, "filesystem", _FILESYSTEM_KEYS, path)
     environment = _table(raw, "environment", _ENVIRONMENT_KEYS, path)
@@ -360,7 +369,8 @@ def load(name: str | None = None) -> Site:
         _validate_root(root, "script_roots entry", path)
     if script_roots:
         warnings.append("script_roots: list each repo as [repos.<name>] with "
-                        "remote = \"...\" and trusted = true instead")
+                        "remote = \"...\" and trusted = true instead (it still "
+                        "works as written)")
     script_confirm = raw.get("script_confirm", [])
     if not isinstance(script_confirm, list) or not all(
         isinstance(v, str) for v in script_confirm
@@ -368,7 +378,8 @@ def load(name: str | None = None) -> Site:
         raise SiteError(f"{path}: script_confirm must be a list of strings")
     if script_confirm:
         warnings.append("script_confirm: give each pattern to the repo it is for, "
-                        "as confirm = [...] in its [repos.<name>] entry")
+                        "as confirm = [...] in its [repos.<name>] entry (it still "
+                        "works as written)")
 
     aliases = _moved(filesystem, "aliases", raw, "aliases", {},
                      "[filesystem] aliases", "[aliases]", path, warnings)
@@ -484,6 +495,15 @@ def _check_sandbox_root(root: str, path: Path, roles: dict, writable: list,
     return root
 
 
+#: Top-level keys and tables of a site file, old spellings included.
+_TOP_KEYS = frozenset({
+    "name", "host", "scheduler", "user", "policy", "paths", "filesystem",
+    "environment", "repos",
+    # older spellings, still read (see _moved)
+    "profile", "writable_roots", "script_roots", "script_confirm", "aliases",
+    "nc_max_read_mb",
+})
+
 #: Keys each new-style table may hold. Strict, like [repos]: a misspelled
 #: key in [policy] would otherwise silently leave a default in force.
 _POLICY_KEYS = frozenset({"profile", "write_roots", "protected", "nc_max_read_mb",
@@ -511,7 +531,7 @@ def _moved(new: dict, new_key: str, old: dict, old_key: str, default,
         raise SiteError(f"{path}: {old_label} and {new_label} are both set; "
                         f"keep {new_label} only")
     if old_key in old:
-        warnings.append(f"{old_label} has moved to {new_label}")
+        warnings.append(f"{old_label} has moved to {new_label} (it still works as written)")
         return old[old_key]
     return new.get(new_key, default)
 

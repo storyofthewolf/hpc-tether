@@ -54,8 +54,8 @@ def main(argv: list[str] | None = None) -> int:
         return exc.code
 
     # Site-file notes need no connection, so they print either way.
-    notes = [f"{target.name}: site file: {note} (the user's edit; "
-             "still works as written)" for note in target.warnings]
+    notes = [f"{target.name}: site file: {note} (the user's to edit)"
+             for note in target.warnings]
 
     if live:
         print(f"{target.name}: master live on {target.host} -- {message}")
