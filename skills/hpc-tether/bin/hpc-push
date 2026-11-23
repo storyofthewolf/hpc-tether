@@ -13,9 +13,11 @@ Every push:
      the drifted remote copy may be someone else's edit, and overwriting it
      silently would destroy the only copy (this read-only precheck also asks
      git whether it tracks the destination)
-  3. requires ``--yes``, a confirmation token the skill ties to explicit
-     per-write user approval; it is checked after the precheck, so the user
-     is never asked to approve a push that would be refused anyway
+  3. requires ``--allow-write``, the same token as any other cluster write:
+     it declares the write, and the approval hook asks the user. It is
+     checked after the precheck, so the user is never asked to approve a
+     push that would be refused anyway. ``--yes`` is its old name, still
+     accepted
   4. uploads beside the destination, then re-verifies, backs up to
      ``<scratch>/hpc-tether-backups/<name>.<stamp>.<hash8>`` and renames into
      place in ONE remote call, so every push is reversible and atomic
@@ -45,7 +47,7 @@ Exit codes:
     70   remote commit failed (temp file vanished, or a backup of that name
          already exists); the destination was not modified and the temp file
          is left in place
-    77   refused before transfer: --yes missing, the profile is below
+    77   refused before transfer: --allow-write missing, the profile is below
          prepare, the destination is outside the write roots, it would put a
          code file in a script root, or git tracks it; no file was sent (the
          git and drift checks are one read-only remote call)
@@ -220,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         epilog=(
             "Exit: 0 ok, 64 usage, 65 drift/overwrite refusal, 69 no master, "
-            "77 missing --yes, 124 timeout, 255 transport failure."
+            "77 missing --allow-write, 124 timeout, 255 transport failure."
         ),
     )
     parser.add_argument("local", metavar="LOCAL", help="locally edited file to push")
@@ -232,10 +234,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--site", metavar="NAME", help="site name from ~/.config/hpc-tether/sites/*.toml")
     parser.add_argument(
-        "--yes",
+        "--allow-write", "--yes",
+        dest="allow_write",
         action="store_true",
-        help="confirmation token: pass only after the user has approved this "
-        "exact write in this exchange",
+        help="token: declares this write; the approval hook asks the user "
+        "(--yes is the old name, still accepted)",
     )
     parser.add_argument(
         "--force",
@@ -389,17 +392,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # The token comes after the read-only precheck, so the user is never
     # asked to approve a push that would be refused anyway (and a tracked
-    # file is refused for being tracked, not for a missing --yes).
-    if not args.yes:
+    # file is refused for being tracked, not for a missing token).
+    if not args.allow_write:
         action = ("create" if remote_state == "MISSING"
                   else "replace (the current copy is backed up first)")
         return _refuse(
             target, remote_path,
-            f"refusing without --yes. The checks passed; this would "
+            f"refusing without --allow-write. The checks passed; this would "
             f"{action} {target.host}:{remote_path}.\n"
-            "--yes is a confirmation token: pass it only after the user has "
-            "approved this exact write.",
-            "no --yes; the checks passed", transport.EXIT_GUARD)
+            "Pass --allow-write to declare the write; the approval hook asks "
+            "the user.",
+            "no --allow-write; the checks passed", transport.EXIT_GUARD)
 
     # --- transfer to a temp file beside the destination ---------------------
     # Uploading onto the destination directly meant an interrupted scp, a full

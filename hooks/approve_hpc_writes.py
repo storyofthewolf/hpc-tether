@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PreToolUse hook: the user, not the agent, approves every hpc-tether token.
 
-The confirmation tokens (--allow-write, --allow-exec, --yes, ...) are flags
+The confirmation tokens (--allow-write, --allow-exec, --force, ...) are flags
 the agent passes itself. They still do two jobs -- they declare intent, so a
 payload the agent thought was read-only but that writes is refused, and they
 leave an audit record -- but they are not consent. Consent has to come from
@@ -47,6 +47,7 @@ BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 TOKENS = {
     "--allow-write": "change files or jobs on the cluster (inside your write roots)",
     "--allow-exec": "run code the agent wrote, which the guard cannot read",
+    # hpc-push's old name for --allow-write, still accepted, so it still asks.
     "--yes": "replace a file on the cluster (backed up first)",
     "--force": "overwrite a cluster file whose drift can't be checked",
     "--overwrite": "overwrite local files",
@@ -104,7 +105,7 @@ def _tokens_used(command: str) -> list[str]:
     This matches text; it does not parse. The parser it replaces looked for
     the verb at the head of each pipeline segment, and every wrapper it did
     not know was a silent pass: `bash -c 'hpc-run --allow-write -'`,
-    `env -i hpc-push --yes f` and a heredoc fed to `bash` all ran with no
+    `env -i hpc-push --allow-write f` and a heredoc fed to `bash` all ran with no
     prompt. Now any command whose text names
     an hpc-tether tool and a token, anywhere, asks. Quotes and backslashes
     are dropped first, so `--allow-"write"` is still the token. A false

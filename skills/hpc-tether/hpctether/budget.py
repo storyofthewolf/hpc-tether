@@ -9,7 +9,7 @@ Every completed transfer is already an audit line carrying ``direction`` and
 ``bytes`` (hpctether/audit.py), so the running total is read from the log --
 no second store to drift from it. Inbound bytes (cluster -> local) count
 against the budget; outbound pushes are single files that already need
-``--yes`` per write, and are reported but not budgeted.
+``--allow-write`` per write, and are reported but not budgeted.
 
 The budget starts at 2 GiB per Claude Code session. A transfer that would take
 the session past it is refused with exit 77, like any other operation that

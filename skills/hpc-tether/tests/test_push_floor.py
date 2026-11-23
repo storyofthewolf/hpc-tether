@@ -61,6 +61,13 @@ class TestPushLocalRefusals(unittest.TestCase):
             return _run(self.mod, [self.local.name, "--site", "testsite", "--to", dest, *extra])
 
     def test_outside_write_roots(self):
+        code, _, err = self.push("/projects/shared/x.csv", "--allow-write")
+        self.assertEqual(code, transport.EXIT_GUARD)
+        self.assertIn("outside the write roots", err)
+
+    def test_old_token_name_still_parses(self):
+        # --yes was hpc-push's name for --allow-write; a usage error (64)
+        # would mean the alias is gone.
         code, _, err = self.push("/projects/shared/x.csv", "--yes")
         self.assertEqual(code, transport.EXIT_GUARD)
         self.assertIn("outside the write roots", err)
@@ -68,17 +75,17 @@ class TestPushLocalRefusals(unittest.TestCase):
     def test_code_into_script_root(self):
         for dest in ("/home/tester/my-tools/x.py", "/home/tester/my-tools/tool"):
             with self.subTest(dest=dest):
-                code, _, err = self.push(dest, "--yes")
+                code, _, err = self.push(dest, "--allow-write")
                 self.assertEqual(code, transport.EXIT_GUARD)
                 self.assertIn("script root", err)
 
     def test_alias_spelling_of_a_script_root_is_caught(self):
-        code, _, err = self.push("/gpfs/home/tester/my-tools/x.py", "--yes")
+        code, _, err = self.push("/gpfs/home/tester/my-tools/x.py", "--allow-write")
         self.assertEqual(code, transport.EXIT_GUARD)
         self.assertIn("script root", err)
 
     def test_data_into_script_root_passes_the_floor(self):
-        # Without --yes it stops at the token, which comes after the floor
+        # Without --allow-write it stops at the token, which comes after the floor
         # and after the read-only precheck.
         mod = self.mod
         reply = subprocess.CompletedProcess([], 0, stdout="MISSING\nUNTRACKED\n", stderr="")
@@ -86,7 +93,7 @@ class TestPushLocalRefusals(unittest.TestCase):
                 mock.patch.object(mod.subprocess, "run") as scp:
             code, _, err = self.push("/home/tester/my-tools/data/m.csv")
         self.assertEqual(code, transport.EXIT_GUARD)
-        self.assertIn("refusing without --yes", err)
+        self.assertIn("refusing without --allow-write", err)
         self.assertIn("would create", err)
         self.assertNotIn("unbacked", err)
         scp.assert_not_called()
@@ -109,23 +116,23 @@ class TestPushTracked(unittest.TestCase):
         return code, err
 
     def test_tracked_destination_refused_before_upload(self):
-        code, err = self.push("abc123\nTRACKED\n", "--yes", "--force")
+        code, err = self.push("abc123\nTRACKED\n", "--allow-write", "--force")
         self.assertEqual(code, transport.EXIT_GUARD)
         self.assertIn("git tracks", err)
 
     def test_tracked_refusal_comes_before_the_token(self):
-        """A tracked README was refused for a missing --yes,
+        """A tracked README was refused for a missing --allow-write,
         so the agent had to ask the user to approve a push bound to fail."""
         code, err = self.push("abc123\nTRACKED\n")
         self.assertEqual(code, transport.EXIT_GUARD)
         self.assertIn("git tracks", err)
-        self.assertNotIn("--yes", err)
+        self.assertNotIn("--allow-write", err)
 
     def test_refusal_is_audited_with_its_reason(self):
         import json
         with tempfile.TemporaryDirectory() as d, \
                 mock.patch.dict(os.environ, {"HPC_TETHER_AUDIT": os.path.join(d, "a.jsonl")}):
-            self.push("abc123\nTRACKED\n", "--yes")
+            self.push("abc123\nTRACKED\n", "--allow-write")
             rows = [json.loads(l) for l in open(os.path.join(d, "a.jsonl"))]
         self.assertEqual((rows[-1]["kind"], rows[-1]["refusal"]), ("refused", "git tracks it"))
 

@@ -15,14 +15,14 @@ file is the judgment around them.
    content sha256.
 2. **Edit locally** with Read/Edit/Write, run local checks, show the user the
    diff when the change is theirs to approve.
-3. **`hpc-push file --yes`** — `--yes` makes the approval hook ask the user,
+3. **`hpc-push file --allow-write`** — the token makes the approval hook ask the user,
    and their answer is the approval for this write. Push re-checksums the remote first and **refuses if it changed since
    the pull**; the drifted copy may be the only copy of someone else's edit.
    The new bytes then land beside the destination, and one remote call
    re-verifies the checksum, copies the current file to
    `<scratch>/hpc-tether-backups/<name>.<stamp>.<hash8>`, and renames the
    upload into place. So every push can be undone, and the destination is
-   never partially written. Without `--yes`, push runs every check (write
+   never partially written. Without `--allow-write`, push runs every check (write
    roots, script roots, git tracking, drift) read-only and either refuses or
    says what it would do, so run it that way first when a refusal is likely,
    before asking the user to approve.

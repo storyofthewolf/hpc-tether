@@ -113,7 +113,7 @@ class TestPushPrecheckGitFailure(unittest.TestCase):
                         mock.patch.object(mod.transport, "run_capture", return_value=reply), \
                         mock.patch.object(mod.subprocess, "run") as scp:
                     code, _, err = _run(mod, [local.name, "--site", "testsite", "--to",
-                                              "scratch:data.csv", "--yes"])
+                                              "scratch:data.csv", "--allow-write"])
                     self.assertEqual(code, transport.EXIT_GUARD)
                     self.assertIn("is unknown", err)
                     scp.assert_not_called()

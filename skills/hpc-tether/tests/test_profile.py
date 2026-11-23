@@ -253,7 +253,7 @@ class TestHpcPushLevels(unittest.TestCase):
     def test_push_refused_at_observe(self):
         with tempfile.NamedTemporaryFile("w", suffix=".txt") as f, Sites("observe"):
             code, _, err = _run(self.mod, [f.name, "--site", "testsite", "--to",
-                                           "/scratch/tester/x.txt", "--yes"])
+                                           "/scratch/tester/x.txt", "--allow-write"])
         self.assertEqual(code, transport.EXIT_GUARD)
         self.assertIn("REFUSED by profile", err)
         self.assertIn("'prepare'", err)

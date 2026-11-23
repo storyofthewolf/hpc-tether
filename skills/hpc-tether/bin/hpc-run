@@ -254,7 +254,7 @@ def _heredoc_hint() -> str:
         "heredocs: their lines and the closing delimiter are checked as "
         "commands, so this refusal is about the heredoc, not the file. To "
         "create or replace a file on the cluster, write it locally and send "
-        "it with `hpc-push LOCAL --to role:path --yes` (profile prepare; the "
+        "it with `hpc-push LOCAL --to role:path --allow-write` (profile prepare; the "
         "user approves the write, and a file it replaces is backed up). Do "
         "not ask for a higher profile to write a file."
     )

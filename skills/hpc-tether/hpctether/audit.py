@@ -23,7 +23,8 @@ view; mode 0600. Each line:
     verb          the bin/ tool that ran (basename of argv[0])
     argv          its arguments, joined
     tokens        which confirmation flags were present on that command line
-                  (--allow-write, --allow-exec, --yes, --force, --force-size,
+                  (--allow-write, --allow-exec, --force, --force-size,
+                  --yes (hpc-push's old name for --allow-write),
                   --merge, --overwrite, --budget-add)
     site, host    from the site file
     kind          "payload" | "scp" | "rsync" | "refused"

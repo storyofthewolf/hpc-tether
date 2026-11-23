@@ -32,7 +32,7 @@ and at the default profile it is refused.
 | Inside a netCDF file: header, stats with NaN/fill counts, a few values, a diff | `bin/hpc-nc header\|stats\|slice\|diff` |
 | Bring a file down | `bin/hpc-pull SRC [DST]` |
 | Bring a directory down | `bin/hpc-fetch SRC [DST]`, with `--dry-run` first |
-| Send an edited file back, or a new one | `bin/hpc-push LOCAL --yes`; new: `--to role:path` |
+| Send an edited file back, or a new one | `bin/hpc-push LOCAL --allow-write`; new: `--to role:path` |
 | Local, GitHub and HPC checkouts agree? | `bin/hpc-sync-status NAME` or `--all` (site `[repos]`), then `reference/git-sync.md` |
 | What was sent, and what data moved | `bin/hpc-audit`; `--transfers --session current` |
 | The user asks what the plugin is doing | `bin/hpc-status` (or they run `/hpc-tether:status`): print its output as is |
@@ -132,7 +132,7 @@ The guard is not a security boundary: never say a thing is "impossible" or
 that observe "cannot write". The backstops are the user's approval prompts,
 the account's own permissions, and backups.
 
-**Tokens**: `--allow-write`, `--allow-exec`, `--yes`, `--force`,
+**Tokens**: `--allow-write`, `--allow-exec`, `--force`,
 `--overwrite`, `--merge`, `--force-size` and `--budget-add`. A token is a
 label, not a permission: it declares what kind of operation the command is,
 and the tool refuses an operation whose label is missing. Add the token an
@@ -184,7 +184,7 @@ scripts.
   roots, for code into a script root, and for a git-tracked file. Tracked
   files change by commit, push, then `git pull` (`reference/git-sync.md`).
 - **A new file (a job script, a config) is written locally and pushed**
-  with `hpc-push LOCAL --to role:path --yes`. Not a heredoc through
+  with `hpc-push LOCAL --to role:path --allow-write`. Not a heredoc through
   `hpc-run`: the guard doesn't read heredocs and refuses them.
 - **Git on a `[repos]` checkout with a `local` side follows its mode**,
   whatever the write roots:

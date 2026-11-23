@@ -25,8 +25,10 @@ class TestAsks(unittest.TestCase):
     def test_every_token_on_every_verb_asks(self):
         for cmd in (f"printf 'mkdir $HPC_SCRATCH/x\\n' | {BIN}/hpc-run --allow-write -",
                     f"{BIN}/hpc-run - --allow-exec < /dev/null",
+                    f"{BIN}/hpc-push f.csv --allow-write",
+                    f"{BIN}/hpc-push f.csv --to scratch:f.csv --allow-write --force",
+                    # --yes is hpc-push's old name for --allow-write: still asks.
                     f"{BIN}/hpc-push f.csv --yes",
-                    f"{BIN}/hpc-push f.csv --to scratch:f.csv --yes --force",
                     f"{BIN}/hpc-pull rundir:x.nc --budget-add 10G",
                     f"{BIN}/hpc-pull rundir:x.nc --force-size",
                     f"{BIN}/hpc-fetch case:x out --merge",

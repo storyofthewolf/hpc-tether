@@ -14,7 +14,7 @@ itself. The toolkit steers; it is not a security boundary. A site
 file with no ``profile`` gets ``observe``.
 
 The profile decides what may be sent at all. The tokens (``--allow-write``,
-``--allow-exec``, ``--yes``) still mark each operation that the profile
+``--allow-exec``) still mark each operation that the profile
 permits but the user must approve.
 
 At ``observe`` only the fixed tools run (hpc-check, hpc-jobs, hpc-read,
