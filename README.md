@@ -100,9 +100,9 @@ asking. Outside it, nothing changes.
   read, mistakes that land somewhere cheap, and a safe place for unattended
   runs. Nothing anywhere allows a deletion.
 
-`hpc-check`, `hpc-status` and `hpc-trust list` show the sandbox roots, and
-the status bar shows `sandbox`. Details: `reference/design.md`, "The
-sandbox".
+`hpc-check`, `hpc-status` and `hpc-trust list` show the sandbox roots. The
+status bar doesn't: it shows state (connected, `UNATTENDED`), and the
+sandbox is a setting. Details: `reference/design.md`, "The sandbox".
 
 ### Unattended sessions
 

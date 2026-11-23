@@ -337,8 +337,6 @@ def site_line(name):
     text = p.stdout + p.stderr
     m = re.search(r"profile (\w+)", text)
     profile = ("profile " + m.group(1)) if m else None
-    if profile and re.search(r"sandbox /\S+", text):
-        profile += " · sandbox"
     if p.returncode == 0:
         conn = "connected"
     elif p.returncode == 69:
